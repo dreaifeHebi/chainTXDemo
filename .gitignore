@@ -1,0 +1,5 @@
+.git-local/
+.playwright-browsers/
+node_modules/
+dist/
+output/
