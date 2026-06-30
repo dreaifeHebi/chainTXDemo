@@ -810,6 +810,7 @@ let stage = 6;
 let timer = null;
 
 const app = document.querySelector("#app");
+const LIVE_RECORD_PATH = "./output/live-record.json";
 
 function esc(value) {
   return String(value)
@@ -1216,7 +1217,7 @@ function renderFooter() {
       <div>
         <p class="eyebrow">devnet wiring</p>
         <h2>Real-node path is already mapped</h2>
-        <p>Use the included Kurtosis params to start geth + lighthouse nodes with RPC snooper enabled, then replace the snapshot rows with live JSON-RPC, txpool, Beacon API, and snooper events.</p>
+        <p>Use the included Kurtosis params to start geth + lighthouse nodes with RPC snooper enabled, then run the live transfer collector. If output/live-record.json exists, this UI loads it as the Live tab.</p>
       </div>
       <code>kurtosis run --enclave tx-flight-recorder github.com/ethpandaops/ethereum-package --args-file network_params.yaml</code>
     </section>
@@ -1319,4 +1320,24 @@ function stopTimer() {
   }
 }
 
+async function loadLiveRecord() {
+  try {
+    const response = await fetch(`${LIVE_RECORD_PATH}?t=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) return;
+
+    const record = await response.json();
+    if (!record?.uiTx?.txHash) return;
+
+    TXS.live = record.uiTx;
+    if (activeKey !== "live") {
+      activeKey = "live";
+      stage = 6;
+    }
+    render();
+  } catch {
+    // Direct file opens and first-run checkouts usually do not have live output yet.
+  }
+}
+
 render();
+loadLiveRecord();

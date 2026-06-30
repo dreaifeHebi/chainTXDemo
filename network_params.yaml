@@ -8,7 +8,7 @@ network_params:
   network_id: "20230618"
   seconds_per_slot: 4
   slot_duration_ms: 4000
-  num_validator_keys_per_node: 64
+  num_validator_keys_per_node: 128
 
 snooper_params:
   enabled: true
