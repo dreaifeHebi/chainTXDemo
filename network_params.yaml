@@ -10,8 +10,10 @@ network_params:
   slot_duration_ms: 4000
   num_validator_keys_per_node: 128
 
+# The snooper records full Beacon/Engine API request and response bodies and can
+# grow by tens of GB per day. Enable it only for short, monitored captures.
 snooper_params:
-  enabled: true
+  enabled: false
 
 additional_services:
   - dora

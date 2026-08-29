@@ -69,7 +69,9 @@ execution-only. It does not model separate beacon or validator services.
 ## Start a separated local PoS devnet
 
 The included `network_params.yaml` is a starting point for a geth + lighthouse
-Kurtosis devnet with RPC snooper enabled:
+Kurtosis devnet. RPC snooping is disabled by default because it records full
+Beacon/Engine API bodies and can grow by tens of GB per day. Enable it only for
+short, monitored captures.
 
 ```bash
 kurtosis run \
@@ -138,7 +140,7 @@ Useful live sources for the next step:
 - Geth txpool API: `txpool_contentFrom`, `txpool_status`
 - Debug API: `debug_traceTransaction`
 - Beacon API: head, finalized checkpoint, validator proposer duties
-- RPC snooper: Engine API calls such as `engine_forkchoiceUpdated`,
+- Optional RPC snooper: Engine API calls such as `engine_forkchoiceUpdated`,
   `engine_getPayload`, and `engine_newPayload`
 
 ## Send one real local transaction

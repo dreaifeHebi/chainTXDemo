@@ -1,11 +1,100 @@
-const STAGES = [
-  { id: "draft", label: "Construct", detail: "fields + fee + gas" },
-  { id: "signed", label: "Sign", detail: "hash + signature + raw tx" },
-  { id: "accepted", label: "RPC accepted", detail: "sendRawTransaction" },
-  { id: "pool", label: "Txpool", detail: "pending / queued" },
-  { id: "payload", label: "Payload", detail: "engine API + proposer" },
-  { id: "executed", label: "Executed", detail: "receipt + trace" },
-  { id: "state", label: "State", detail: "diff + finality" },
+const FLOW_STEPS = [
+  {
+    id: "intent",
+    label: "Web 决定发起",
+    detail: "用户操作变成交易意图",
+    actor: "Web / DApp",
+    from: "用户操作",
+    to: "交易请求",
+    input: "页面上的业务操作",
+    action: "决定接收方、金额或合约方法参数",
+    output: "尚未签名的交易意图",
+    summary: "Web 只是在表达“想做什么”。这时还没有签名、txHash、txpool 记录，也没有任何链上状态变化。",
+  },
+  {
+    id: "construct",
+    label: "构造交易",
+    detail: "补齐 nonce、gas、fee、calldata",
+    actor: "Web + RPC（只读）",
+    from: "交易意图",
+    to: "Unsigned Tx",
+    input: "to / value / 方法参数",
+    action: "查询链信息并编码交易字段",
+    output: "可以交给钱包签名的交易对象",
+    summary: "应用会读取 chainId、pending nonce、费用和 gas 估算，再把业务参数编码成一份未签名交易。预检查 RPC 不会修改链上状态。",
+  },
+  {
+    id: "sign",
+    label: "钱包签名",
+    detail: "授权并生成 raw transaction",
+    actor: "Wallet / Signer",
+    from: "Unsigned Tx",
+    to: "Raw Tx + txHash",
+    input: "完整的未签名交易字段",
+    action: "用私钥签交易摘要并序列化",
+    output: "可广播的 raw tx 与交易哈希",
+    summary: "签名证明账户授权了这组字段。签名仍发生在链外；只签名但不广播，不会消耗 nonce 或 gas。",
+  },
+  {
+    id: "rpc",
+    label: "RPC 提交",
+    detail: "把 raw tx 交给执行节点",
+    actor: "RPC Gateway",
+    from: "钱包 / Web",
+    to: "Execution Node A",
+    input: "已签名的 raw transaction",
+    action: "调用 eth_sendRawTransaction 并转交节点",
+    output: "txHash 或明确的 RPC 拒绝错误",
+    summary: "RPC 是入口，不是共识者。返回 txHash 只代表这台节点接受了提交请求，不代表交易已经入块或执行成功。",
+  },
+  {
+    id: "node",
+    label: "节点接收处理",
+    detail: "校验、入池、P2P 传播",
+    actor: "Execution Node / Geth",
+    from: "RPC 边界",
+    to: "Txpool + EL P2P",
+    input: "节点收到的 raw transaction",
+    action: "检查签名、nonce、余额、gas 与本地策略",
+    output: "pending / queued / rejected",
+    summary: "通过检查的交易进入这台节点自己的 txpool，并通过执行层 P2P 传播给其他节点。全网不存在一个统一的 txpool。",
+  },
+  {
+    id: "payload",
+    label: "打包进区块",
+    detail: "EL 构建 payload，validator 签块",
+    actor: "EL + CL + Validator",
+    from: "Txpool",
+    to: "Beacon Block",
+    input: "当前 head 与本地待处理交易",
+    action: "选择交易、执行候选 payload、签署区块",
+    output: "包含 execution payload 的 Beacon Block",
+    summary: "当前 slot 的 proposer 触发出块。Consensus Client 通过 Engine API 让 Execution Client 构建 payload，Validator Client 最后签署区块。",
+  },
+  {
+    id: "execute",
+    label: "EVM 执行",
+    detail: "所有节点重放并验证结果",
+    actor: "Execution Clients",
+    from: "Proposed Block",
+    to: "Receipt + State Root",
+    input: "区块中的 execution payload",
+    action: "逐笔重执行交易并检查状态根",
+    output: "receipt、status、gas、logs、trace",
+    summary: "真正运行合约代码的是 Execution Client。其他节点会重放相同交易；结果不一致时，这个区块就是无效的。",
+  },
+  {
+    id: "chain",
+    label: "上链与确认",
+    detail: "状态落入区块并走向 finality",
+    actor: "Chain / Consensus",
+    from: "Valid Block",
+    to: "Latest → Safe → Finalized",
+    input: "有效区块与 validators 的 attestations",
+    action: "更新 canonical head、safe 与 finalized checkpoint",
+    output: "持久状态变化与确认级别",
+    summary: "receipt 出现表示交易已进入某个区块；随后还要经历 safe 和 finalized。最终性属于区块，交易随所在区块一起最终确定。",
+  },
 ];
 
 const ADDRESSES = {
@@ -806,7 +895,7 @@ const TXS = {
 
 let activeKey = "transfer";
 let activeType = "2";
-let stage = 6;
+let stage = 0;
 let timer = null;
 
 const app = document.querySelector("#app");
@@ -821,74 +910,24 @@ function esc(value) {
     .replaceAll("'", "&#039;");
 }
 
-function rowClass(itemStage) {
-  if (itemStage < stage) return "ready";
-  if (itemStage === stage) return "current";
-  return "waiting";
-}
-
-function renderRows(rows, columns) {
-  return rows
-    .map((row) => {
-      const itemStage = row[row.length - 1];
-      const cells = row
-        .slice(0, columns)
-        .map((cell) => `<td><code>${esc(cell)}</code></td>`)
-        .join("");
-      return `<tr class="${rowClass(itemStage)}">${cells}</tr>`;
-    })
-    .join("");
-}
-
-function renderKv(title, rows) {
-  return `
-    <div class="module">
-      <h3>${esc(title)}</h3>
-      <table class="kv">
-        <tbody>${renderRows(rows, 2)}</tbody>
-      </table>
-    </div>
-  `;
-}
-
-function renderOptionalKv(title, rows) {
-  if (!rows || rows.length === 0) return "";
-  return renderKv(title, rows);
-}
-
 function renderBroadcastRows(tx) {
   return tx.broadcast || [
-    ["local signer", "serialized raw transaction bytes are produced before RPC sees anything", 1],
-    ["Node A RPC", "eth_sendRawTransaction validates envelope, signature, nonce, fee cap, and intrinsic gas", 2],
-    ["local txpool", "pending if executable now, queued if the sender nonce has a gap", 3],
-    ["EL P2P gossip", "Node A announces the transaction and Node B imports it into its txpool", 3],
-    ["payload boundary", "validator never executes Solidity directly; CL asks EL to build an execution payload", 4],
+    ["本地签名器", "先生成 serialized raw transaction；此时 RPC 还没有看到交易", 1],
+    ["Node A RPC", "eth_sendRawTransaction 检查 envelope、签名、nonce、fee cap 与 intrinsic gas", 2],
+    ["本地 txpool", "当前可执行则进入 pending；sender nonce 有缺口时进入 queued", 3],
+    ["EL P2P gossip", "Node A 广播交易，Node B 独立检查后放入自己的 txpool", 3],
+    ["Payload 边界", "Validator Client 不执行 Solidity；CL 通过 Engine API 请求 EL 构建 payload", 4],
   ];
 }
 
 function renderValidatorRows(tx) {
   return tx.validator || [
-    ["slot duty", "Beacon state maps the slot to a proposer index", "validator client prepares a block proposal request", 4],
-    ["payload attributes", "Consensus client sends engine_forkchoiceUpdated", "execution client starts building a payload on the current head", 4],
-    ["tx selection", "Execution client pulls profitable valid txs from txpool", "payload ordering is checked by nonce, gas, and block gas limit", 4],
-    ["block proposal", "validator signs the beacon block", "execution payload is embedded in the beacon block body", 4],
-    ["attestation", "other validators vote for the head", "safe/finalized status comes later than the transaction receipt", 6],
+    ["Slot duty", "Beacon state 确定本 slot 的 proposer", "Validator Client 准备请求区块提议", 4],
+    ["Payload attributes", "Consensus Client 发送 engine_forkchoiceUpdated", "Execution Client 基于当前 head 开始构建 payload", 4],
+    ["选择交易", "Execution Client 从本地 txpool 选择有效交易", "同时检查 nonce 顺序、gas 与 block gas limit", 4],
+    ["提议区块", "Validator Client 签署 Beacon Block", "Execution payload 被放进 Beacon Block body", 4],
+    ["Attestation", "其他 validators 对 head 投票", "safe / finalized 会晚于 transaction receipt", 6],
   ];
-}
-
-function renderSimpleTable(title, headers, rows) {
-  if (!rows || rows.length === 0) return "";
-  return `
-    <div class="module">
-      <h3>${esc(title)}</h3>
-      <table class="wide">
-        <thead>
-          <tr>${headers.map((header) => `<th>${esc(header)}</th>`).join("")}</tr>
-        </thead>
-        <tbody>${renderRows(rows, headers.length)}</tbody>
-      </table>
-    </div>
-  `;
 }
 
 function typeDef() {
@@ -960,384 +999,1128 @@ function renderTypeTabs() {
     .join("");
 }
 
-function renderTypeStrip(tx) {
-  const def = typeDef();
-  const warning = compatibilityLabel(tx, def).startsWith("Incompatible")
-    ? `<div class="compat-warning">${esc(compatibilityLabel(tx, def))}</div>`
-    : "";
-  return `
-    <section class="type-strip">
-      <div class="type-copy">
-        <p class="eyebrow">transaction envelope</p>
-        <h2>Type 0-4 format switch</h2>
-        <p>${esc(def.envelope)}</p>
-      </div>
-      <div class="type-tabs">${renderTypeTabs()}</div>
-      ${warning}
-    </section>
-  `;
-}
-
-function renderEventList(events) {
-  return `
-    <ol class="event-list">
-      ${events
-        .map((event) => {
-          const itemStage = event[4];
-          return `
-            <li class="${rowClass(itemStage)}">
-              <span class="time">${esc(event[0])}</span>
-              <div>
-                <strong>${esc(event[2])}</strong>
-                <p>${esc(event[1])} - ${esc(event[3])}</p>
-              </div>
-            </li>
-          `;
-        })
-        .join("")}
-    </ol>
-  `;
-}
-
-function renderTrace(trace) {
-  return `
-    <table class="trace">
-      <thead>
-        <tr><th>Step</th><th>Gas</th><th>Meaning</th></tr>
-      </thead>
-      <tbody>${renderRows(trace, 3)}</tbody>
-    </table>
-  `;
-}
-
-function renderDiffs(diffs) {
-  return `
-    <table class="diff">
-      <thead>
-        <tr><th>State</th><th>Before</th><th>After</th><th>Why</th></tr>
-      </thead>
-      <tbody>${renderRows(diffs, 4)}</tbody>
-    </table>
-  `;
-}
-
-function renderPool(rows) {
-  return `
-    <table class="pool">
-      <thead>
-        <tr><th>Node</th><th>Seen</th><th>Status</th><th>Nonce</th><th>Note</th></tr>
-      </thead>
-      <tbody>${renderRows(rows, 5)}</tbody>
-    </table>
-  `;
-}
-
-function renderFinality(rows) {
-  return `
-    <div class="finality">
-      ${rows
-        .map((row) => {
-          const [name, time, detail, itemStage] = row;
-          return `
-            <div class="finality-item ${rowClass(itemStage)}">
-              <span>${esc(name)}</span>
-              <strong>${esc(time)}</strong>
-              <small>${esc(detail)}</small>
-            </div>
-          `;
-        })
-        .join("")}
-    </div>
-  `;
-}
-
 function renderJson(record) {
   return `<pre class="json">${esc(JSON.stringify(record, null, 2))}</pre>`;
 }
 
-function renderTabs() {
+const LIVE_STEP_EVIDENCE = [
+  {
+    label: "根据交易反推",
+    tone: "inferred",
+    note: "现有采集器没有记录用户在 Web 上点击了什么；这里只能根据最终交易反推原始意图。",
+  },
+  {
+    label: "部分实测",
+    tone: "partial",
+    note: "链 ID、交易字段和部分余额来自真实节点；完整的 fee / estimateGas 预检查过程没有逐条抓取。",
+  },
+  {
+    label: "部分实测",
+    tone: "partial",
+    note: "记录确认了 cast 的签名边界和 txHash，但没有保存完整 raw tx、签名摘要与 r/s 字段。",
+  },
+  {
+    label: "实测",
+    tone: "observed",
+    note: "提交方式、txHash、交易查询和 receipt 查询来自这笔真实本地交易。",
+  },
+  {
+    label: "采样过晚",
+    tone: "partial",
+    note: "这笔 Live 在读取 txpool 时已经入块，因此只能看到 not present，不能证明它此前没有进入 pending。",
+  },
+  {
+    label: "上下文快照",
+    tone: "partial",
+    note: "Live 只读取了 execution block 与 Beacon head/finality 快照，没有抓到本次 Engine API 调用或 proposer 签名。",
+  },
+  {
+    label: "实测",
+    tone: "observed",
+    note: "receipt、gasUsed、status、block 与 debug_traceTransaction 来自真实执行节点。",
+  },
+  {
+    label: "部分实测",
+    tone: "partial",
+    note: "余额、nonce 与 stateRoot 来自真实查询；finality 只是当时 checkpoint 快照，尚未关联证明这笔交易已 finalized。",
+  },
+];
+
+const SCENARIO_META = {
+  transfer: {
+    label: "普通转账",
+    title: "示例：原生 ETH 转账",
+    subtitle: "Alice 直接给 Bob 转账；没有 calldata，也不会执行合约代码。",
+  },
+  deploy: {
+    label: "部署合约",
+    title: "示例：部署 CounterVault",
+    subtitle: "交易没有 to 地址，input 中携带 init code，执行后生成新的合约地址和代码。",
+  },
+  call: {
+    label: "合约调用",
+    title: "示例：调用 increase(7)",
+    subtitle: "Web 把方法与参数编码成 calldata，EVM 执行后修改合约 storage。",
+  },
+  receive: {
+    label: "合约收款",
+    title: "示例：给合约转入 ETH",
+    subtitle: "to 是合约地址、value 大于 0、calldata 为空，因此触发 receive()。",
+  },
+  typed712: {
+    label: "签名代付",
+    title: "示例：EIP-712 授权 + Relayer 代付",
+    subtitle: "Alice 只做链下授权；Relayer 构造并发送真正的链上交易，同时支付 gas。",
+  },
+  fail: {
+    label: "执行失败",
+    title: "示例：交易入块后 Revert",
+    subtitle: "交易可以进入区块但执行失败；合约状态回滚，sender 的 nonce 与 gas 仍被消耗。",
+  },
+  gap: {
+    label: "Nonce 缺口",
+    title: "示例：Nonce gap 与 txpool 排队",
+    subtitle: "nonce 9 先到时进入 queued，nonce 8 到达后两笔交易才一起变成 pending。",
+  },
+  live: {
+    label: "Live 实测",
+    title: "真实记录：本地 ETH 转账",
+    subtitle: "这是一笔曾经提交给本地 PoS devnet 的真实交易记录，并非刚刚生成的新交易。",
+  },
+};
+
+function scenarioMeta(tx) {
+  return SCENARIO_META[activeKey] || {
+    label: tx.label,
+    title: tx.title,
+    subtitle: tx.subtitle,
+  };
+}
+
+function renderJourneyTabs() {
   return Object.entries(TXS)
     .map(([key, tx]) => {
       const selected = key === activeKey ? "selected" : "";
-      return `<button class="tab ${selected}" data-tx="${esc(key)}">${esc(tx.label)}</button>`;
+      const label = SCENARIO_META[key]?.label || tx.label;
+      return `<button class="tab ${selected}" data-tx="${esc(key)}">${esc(label)}</button>`;
     })
     .join("");
 }
 
-function renderStageControls() {
-  return STAGES.map((item, index) => {
-    const selected = index === stage ? "selected" : "";
-    const done = index < stage ? "done" : "";
-    return `
-      <button class="stage ${selected} ${done}" data-stage="${index}">
-        <span>${index + 1}</span>
-        <strong>${esc(item.label)}</strong>
-        <small>${esc(item.detail)}</small>
-      </button>
-    `;
-  }).join("");
+function journeyEvidence() {
+  if (activeKey === "live") return LIVE_STEP_EVIDENCE[stage];
+  return {
+    label: "教学示意",
+    tone: "illustrative",
+    note: "这个场景用于解释机制；时间、节点、hash 与执行结果是固定示例，不是当前节点日志。",
+  };
 }
 
-function topologyStatus(index) {
-  if (stage > index) return "ready";
-  if (stage === index) return "current";
-  return "waiting";
+function txField(tx, name, fallback = "未提供") {
+  return tx.txFields?.find(([field]) => field === name)?.[1] || fallback;
 }
 
-function renderTopology(tx) {
-  const nodes = [
-    ["Signer", "local script", 1],
-    ["Node A", "RPC + txpool + EL", 2],
-    ["Node B", "EL P2P observer", 3],
-    ["Beacon", "fork choice + payload", 4],
-    ["Validator", "proposer / attester", 4],
-    ["Chain", "latest -> safe -> finalized", 6],
+function selectTxFields(tx, names) {
+  return (tx.txFields || []).filter(([name]) => names.includes(name));
+}
+
+function rowValue(rows, matcher, fallback = "未记录") {
+  const row = (rows || []).find(([name]) => {
+    if (typeof matcher === "string") return name === matcher;
+    return matcher.test(name);
+  });
+  return row?.[1] || fallback;
+}
+
+function builderEventDetail(tx, matcher, fallback = "未记录") {
+  const event = (tx.builder || []).find((row) => matcher.test(row[2]));
+  return event?.[3] || fallback;
+}
+
+function transactionRequestRows(tx) {
+  return [
+    ["from", txField(tx, "from")],
+    ["to", txField(tx, "to")],
+    ["value", txField(tx, "value", "0")],
+    ["data", txField(tx, "input", "0x")],
+  ];
+}
+
+function unsignedTransactionRows(tx) {
+  return selectTxFields(tx, [
+    "type",
+    "chainId",
+    "nonce",
+    "to",
+    "value",
+    "input",
+    "gas",
+    "maxFeePerGas",
+    "maxPriorityFeePerGas",
+  ]);
+}
+
+function signatureSummary(tx) {
+  const parts = ["yParity", "r", "s"]
+    .map((name) => {
+      const value = rowValue(tx.signing, name, "");
+      return value ? `${name}=${value}` : "";
+    })
+    .filter(Boolean);
+  return parts.join(" · ") || rowValue(tx.signing, /signing boundary|send mode/i, "签名字段未保存");
+}
+
+function transformationModel(tx) {
+  const scenario = scenarioMeta(tx);
+  const pool = tx.txpool?.[0] || [];
+  const receiptBlock = rowValue(tx.receipt, "blockNumber");
+  const receiptStatus = rowValue(tx.receipt, "status");
+  const receiptGas = rowValue(tx.receipt, "gasUsed");
+  const requestRows = transactionRequestRows(tx);
+  const unsignedRows = unsignedTransactionRows(tx);
+  const rawTx = rowValue(tx.signing, /^raw tx$/i, "完整 raw bytes 未保留");
+  const signingHash = rowValue(tx.signing, /signing hash|digest/i, "签名摘要未保留");
+  const chainId = txField(tx, "chainId", rowValue(tx.preflight, "eth_chainId"));
+  const nonce = txField(tx, "nonce", rowValue(tx.preflight, /TransactionCount/i));
+  const gas = txField(tx, "gas", rowValue(tx.preflight, /estimateGas/i));
+  const maxFee = txField(tx, "maxFeePerGas", "未记录");
+  const priorityFee = txField(tx, "maxPriorityFeePerGas", "未记录");
+  const blockHash = tx.record?.blockHash || "uiTx.record 未保存 blockHash";
+  const slot = tx.record?.includedSlot || builderEventDetail(tx, /head|proposed/i);
+
+  const models = [
+    {
+      input: {
+        kind: "UIIntent",
+        title: "用户在页面上表达的业务动作",
+        rows: [
+          ["场景", scenario.title],
+          ["页面动作", tx.interface?.[0]?.[1] || tx.label],
+          ["用户目标", tx.subtitle],
+        ],
+        note: "这里还是普通 Web 状态，没有交易格式，也没有链上副作用。",
+      },
+      operations: [
+        {
+          title: "读取页面状态",
+          detail: "取得用户选择的接收方、金额或合约方法参数。",
+          result: `to=${txField(tx, "to")} · value=${txField(tx, "value", "0")}`,
+        },
+        {
+          title: "标准化业务参数",
+          detail: "把 ETH 金额转成 wei；把合约方法和参数整理成 ABI 可编码的值。",
+          result: tx.abi?.[2]?.[1] || txField(tx, "input", "0x"),
+        },
+        {
+          title: "生成交易请求",
+          detail: "只保留发起交易所需的 to、value、data 等最小字段。",
+          result: "TransactionRequest ready",
+        },
+      ],
+      output: {
+        kind: "TransactionRequest",
+        title: "交给钱包/SDK 的未补全请求",
+        rows: requestRows,
+        note: "它还没有 chainId、nonce、gas、fee 或签名。",
+      },
+      explanation: "页面意图经过单位换算与 ABI 参数整理，才从“用户想做什么”变成机器可继续处理的 TransactionRequest。",
+    },
+    {
+      input: {
+        kind: "TransactionRequest",
+        title: "来自 Web 的最小交易请求",
+        rows: requestRows,
+        note: "这些字段表达业务目的，但还不足以签名和广播。",
+      },
+      operations: [
+        {
+          title: "读取链 ID",
+          detail: "防止交易被拿到另一条链重放。",
+          result: `chainId = ${chainId}`,
+        },
+        {
+          title: "取得 pending nonce",
+          detail: "决定这笔交易在 sender 交易序列中的位置。",
+          result: `nonce = ${nonce}`,
+        },
+        {
+          title: "估算 gas 与费用",
+          detail: "模拟所需 gas，并补齐 maxFeePerGas / priority fee。",
+          result: `gas=${gas} · maxFee=${maxFee} · priority=${priorityFee}`,
+        },
+        {
+          title: "选择 envelope 并编码",
+          detail: "把所有字段按交易类型组织成可签名的 payload。",
+          result: `recorded type = ${txField(tx, "type", "unknown")}`,
+        },
+      ],
+      output: {
+        kind: "UnsignedTransaction",
+        title: "字段完整、但尚未授权的交易",
+        rows: unsignedRows,
+        note: "字段一旦签名就不能再改；改动任意一项都会得到不同签名和 txHash。",
+      },
+      explanation: "只读 RPC 查询把链的当前状态补进请求，最终形成字段确定、可以交给钱包签名的 UnsignedTransaction。",
+    },
+    {
+      input: {
+        kind: "UnsignedTransaction",
+        title: "等待账户授权的完整交易",
+        rows: unsignedRows,
+        note: "它说明要执行什么，但还不能证明 sender 同意。",
+      },
+      operations: [
+        {
+          title: "构造 signing preimage",
+          detail: "按交易类型序列化不含最终签名字段的 payload。",
+          result: typeDef().signing,
+        },
+        {
+          title: "计算签名摘要",
+          detail: "对 signing preimage 做 keccak256。",
+          result: signingHash,
+        },
+        {
+          title: "钱包使用私钥签名",
+          detail: "私钥不离开钱包，产出 yParity、r、s。",
+          result: signatureSummary(tx),
+        },
+        {
+          title: "附加签名并序列化",
+          detail: "把签名字段放回 envelope，生成可广播的 raw transaction。",
+          result: rawTx,
+        },
+        {
+          title: "计算交易哈希",
+          detail: "对最终 raw tx 做 keccak256，得到全网引用它的 txHash。",
+          result: tx.txHash,
+        },
+      ],
+      output: {
+        kind: "SignedRawTransaction",
+        title: "已经授权、可以广播的字节串",
+        rows: [
+          ["from（由签名恢复）", txField(tx, "from")],
+          ["signature", signatureSummary(tx)],
+          ["raw tx", rawTx],
+          ["txHash", tx.txHash],
+        ],
+        note: "签名发生在链外；到这里仍未进入任何节点。",
+      },
+      explanation: "签名把“字段完整的请求”变成不可篡改的授权指令；raw tx 中任何字节变化都会让签名或 txHash 改变。",
+    },
+    {
+      input: {
+        kind: "SignedRawTransaction",
+        title: "Wallet 准备提交的 raw tx",
+        rows: [
+          ["method", "eth_sendRawTransaction"],
+          ["params[0]", rawTx],
+          ["client txHash", tx.txHash],
+        ],
+        note: "RPC 只负责把已签名交易交到 Execution Client 的入口。",
+      },
+      operations: [
+        {
+          title: "封装 JSON-RPC / HTTP",
+          detail: "客户端把 raw tx 放进 method 与 params。",
+          result: "JSON-RPC request id=1",
+        },
+        {
+          title: "Gateway 路由请求",
+          detail: "实际服务可能处理鉴权、限流和负载均衡，再转给一台执行节点。",
+          result: "routed to Execution Node A",
+        },
+        {
+          title: "调用节点 RPC 方法",
+          detail: "执行节点接收 eth_sendRawTransaction；交易语义检查在下一步展开。",
+          result: rowValue(tx.rpc, /sendRawTransaction|cast send|sendTransaction/i),
+        },
+        {
+          title: "返回同步结果",
+          detail: "成功时返回 txHash，失败时返回 JSON-RPC error。",
+          result: tx.txHash,
+        },
+      ],
+      output: {
+        kind: "RPC Handoff",
+        title: "节点得到 raw tx，客户端得到 txHash",
+        rows: [
+          ["node receives", "signed raw transaction"],
+          ["client receives", tx.txHash],
+          ["included?", "尚未保证"],
+          ["executed successfully?", "尚未执行"],
+        ],
+        note: "RPC 返回成功不是上链成功，只是完成了提交交接。",
+      },
+      explanation: "这一段只改变“交易在哪里”：raw tx 从客户端跨过 RPC 边界到达节点；交易内容本身不会被 RPC 改写。",
+    },
+    {
+      input: {
+        kind: "RPC Handoff",
+        title: "Execution Node 收到的已签名交易",
+        rows: [
+          ["txHash", tx.txHash],
+          ["type", txField(tx, "type")],
+          ["nonce", nonce],
+          ["from", txField(tx, "from")],
+          ["gas / maxFee", `${gas} / ${maxFee}`],
+        ],
+        note: "节点必须独立验证，不能因为 RPC 已返回就盲目信任。",
+      },
+      operations: [
+        {
+          title: "解码 envelope",
+          detail: "识别交易类型并解析 chainId、nonce、gas、to、value、data 与签名。",
+          result: `decoded ${txField(tx, "type", "transaction")}`,
+        },
+        {
+          title: "恢复 sender",
+          detail: "从签名恢复公钥地址，验证交易没有被篡改。",
+          result: `from = ${txField(tx, "from")}`,
+        },
+        {
+          title: "执行入池规则",
+          detail: "检查 chainId、nonce、余额、intrinsic gas、fee cap 与节点策略。",
+          result: activeKey === "live" ? "入池返回未捕获；该交易后来被有效区块执行" : "accepted by local admission",
+        },
+        {
+          title: "归类 txpool",
+          detail: "nonce 连续则 pending；存在缺口则 queued；不合法则 rejected。",
+          result: `observed status = ${pool[2] || "unknown"}`,
+        },
+        {
+          title: "执行层 P2P 传播",
+          detail: "向其他 Execution Nodes 宣告交易；对方仍会重新验证。",
+          result: "peer txpools may now contain the tx",
+        },
+      ],
+      output: {
+        kind: activeKey === "live" ? "TxpoolObservation" : "TxpoolEntry",
+        title: activeKey === "live" ? "采集器读到的 txpool 时点快照" : "本地节点对交易的排队结果",
+        rows: [
+          ["node", pool[0] || "unknown"],
+          ["observed at", pool[1] || "unknown"],
+          ["status", pool[2] || "unknown"],
+          ["nonce", pool[3] || nonce],
+          ["detail", pool[4] || "未记录"],
+        ],
+        note: activeKey === "live" ? "Live 的采样发生在入块后，因此 not present 不代表它从未 pending。" : "这是教学场景中的节点 txpool 快照。",
+      },
+      explanation: activeKey === "live"
+        ? "节点正常情况下会把通过 admission 的交易变成 TxpoolEntry；但这份 Live 在交易入块后才采样，因此实际留下的是一条 post-inclusion TxpoolObservation。"
+        : "节点把不可信的 raw bytes 逐项验证，只有通过本地 admission 规则后，才会把它变成可排队和传播的 TxpoolEntry。",
+    },
+    {
+      input: {
+        kind: "BuildContext",
+        title: "Proposer 本 slot 的构建上下文",
+        rows: [
+          ["current head", builderEventDetail(tx, /forkchoice|head/i)],
+          ["candidate tx", tx.txHash],
+          ["txpool status", pool[2] || "unknown"],
+          ["slot / duty", slot],
+        ],
+        note: "Proposer 只能从自己能看到的交易与当前 head 出发构建区块。",
+      },
+      operations: [
+        {
+          title: "获得 proposer duty",
+          detail: "Beacon state 为当前 slot 选定 proposer。",
+          result: `proposer = ${tx.record?.proposerIndex ?? "Live 未抓取"}`,
+        },
+        {
+          title: "CL 通知 fork choice",
+          detail: "Consensus Client 调用 engine_forkchoiceUpdated，并附带 payload attributes。",
+          result: builderEventDetail(tx, /forkchoice|head/i),
+        },
+        {
+          title: "EL 选择并排序交易",
+          detail: "从本地 txpool 选择有效且可执行的交易，遵守 nonce 与 block gas limit。",
+          result: `include tx ${tx.txHash}`,
+        },
+        {
+          title: "执行候选 payload",
+          detail: "Execution Client 预执行交易，计算 stateRoot、receiptsRoot 与 gasUsed。",
+          result: `candidate status = ${receiptStatus}`,
+        },
+        {
+          title: "取回 payload 并签块",
+          detail: "CL 调用 engine_getPayload；Validator Client 签署 Beacon Block。",
+          result: builderEventDetail(tx, /getPayload|proposed/i),
+        },
+      ],
+      output: {
+        kind: "ExecutionPayload",
+        title: "嵌入 Beacon Block 的执行区块",
+        rows: [
+          ["slot", slot],
+          ["blockNumber", receiptBlock],
+          ["blockHash", blockHash],
+          ["tx[transactionIndex]", `${tx.record?.transactionIndex ?? rowValue(tx.receipt, "transactionIndex")} → ${tx.txHash}`],
+          ["proposerIndex", tx.record?.proposerIndex ?? "Live 未抓取"],
+        ],
+        note: "这一步的输出不再是单笔交易，而是包含多笔交易及执行承诺的区块 payload。",
+      },
+      explanation: "EL 把 TxpoolEntry 与当前链头组合、排序并预执行，CL/Validator 再把所得 ExecutionPayload 封装并签成可广播区块。",
+    },
+    {
+      input: {
+        kind: "ExecutionPayload",
+        title: "其他节点收到的 proposed block",
+        rows: [
+          ["blockNumber", receiptBlock],
+          ["blockHash", blockHash],
+          ["transactionIndex", tx.record?.transactionIndex ?? rowValue(tx.receipt, "transactionIndex")],
+          ["transaction", tx.txHash],
+        ],
+        note: "其他节点不能直接相信 proposer 给出的执行结果。",
+      },
+      operations: [
+        {
+          title: "校验区块上下文",
+          detail: "检查 parent、timestamp、gas limit 等执行区块约束。",
+          result: "block context accepted for execution",
+        },
+        {
+          title: "重做交易前置检查",
+          detail: "再次检查签名、账户 nonce、余额与 gas。",
+          result: `sender nonce = ${nonce}`,
+        },
+        {
+          title: "应用状态转换",
+          detail: "执行 ETH transfer 或进入 EVM 运行 calldata 对应代码。",
+          result: tx.trace?.[0]?.[2] || "state transition executed",
+        },
+        {
+          title: "生成 receipt",
+          detail: "累计 gas、logs、status，并形成 receiptsRoot。",
+          result: `status=${receiptStatus} · gasUsed=${receiptGas}`,
+        },
+        {
+          title: "核对 payload roots",
+          detail: "把本地计算结果与 proposer 声明的 roots 比较。",
+          result: `VALID（区块有效；交易 receipt.status=${receiptStatus}）`,
+        },
+      ],
+      output: {
+        kind: "TransactionReceipt",
+        title: "节点独立重放后的执行结果",
+        rows: (tx.receipt || []).map(([name, value]) => [name, value]),
+        note: "receipt.status 说明 EVM 是否成功；它与 RPC 是否接受交易是两件不同的事。",
+      },
+      explanation: "其他 Execution Clients 用同一输入重新计算；只有本地 receipt、state root 等结果与 payload 一致，区块才通过执行验证。",
+    },
+    {
+      input: {
+        kind: "ValidatedBlock",
+        title: "执行层已判定有效的区块",
+        rows: [
+          ["blockNumber", receiptBlock],
+          ["transaction status", receiptStatus],
+          ["txHash", tx.txHash],
+          ["attestations", "等待 validators 对 head/source/target 投票"],
+        ],
+        note: "交易已有 receipt，但所在区块仍可能处于 latest，尚未 finalized。",
+      },
+      operations: [
+        {
+          title: "导入 latest head",
+          detail: "节点把有效区块加入本地 fork-choice view。",
+          result: rowValue(tx.finality, "latest"),
+        },
+        {
+          title: "Validators 发 attestation",
+          detail: "委员会对看到的 head 及 checkpoint 投票。",
+          result: "attestation weight accumulates",
+        },
+        {
+          title: "Fork choice 更新 safe",
+          detail: "足够共识权重降低短期 reorg 风险。",
+          result: rowValue(tx.finality, "safe", rowValue(tx.finality, "justified")),
+        },
+        {
+          title: "Checkpoint finalized",
+          detail: "达到 supermajority link 后，区块及其中交易获得最终性。",
+          result: rowValue(tx.finality, "finalized"),
+        },
+        {
+          title: "提交 canonical state",
+          detail: "账户余额、nonce 与合约 storage 作为 canonical chain 状态保留。",
+          result: `${tx.diffs?.length || 0} 项状态差异`,
+        },
+      ],
+      output: {
+        kind: "CanonicalState",
+        title: "链上状态与交易确认级别",
+        rows: [
+          ...(tx.diffs || []).map(([name, , after]) => [name, after]),
+          ...(tx.finality || []).map(([name, time]) => [`confirmation.${name}`, time]),
+        ],
+        note: "最终输出不是一个新 tx，而是被共识认可的区块位置和由交易造成的新状态。",
+      },
+      explanation: "执行有效只是第一层；attestations 与 checkpoint 共识继续提高确认级别，最终把区块内状态变化固定到 canonical chain。",
+    },
   ];
 
+  return models[stage];
+}
+
+function renderDataRows(rows = [], columns = 2) {
+  return rows
+    .map((row) => {
+      const cells = row
+        .slice(0, columns)
+        .map((cell) => `<td><code>${esc(cell)}</code></td>`)
+        .join("");
+      return `<tr>${cells}</tr>`;
+    })
+    .join("");
+}
+
+function renderDataKv(title, rows) {
+  if (!rows || rows.length === 0) return "";
   return `
-    <section class="topology">
-      <div class="topology-copy">
-        <p class="eyebrow">local PoS devnet trace</p>
-        <h1>${esc(tx.title)}</h1>
-        <p>${esc(tx.subtitle)}</p>
+    <section class="result-block">
+      <h3>${esc(title)}</h3>
+      <table class="kv"><tbody>${renderDataRows(rows, 2)}</tbody></table>
+    </section>
+  `;
+}
+
+function renderDataTable(title, headers, rows) {
+  if (!rows || rows.length === 0) return "";
+  return `
+    <section class="result-block">
+      <h3>${esc(title)}</h3>
+      <div class="table-scroll">
+        <table class="wide">
+          <thead><tr>${headers.map((header) => `<th>${esc(header)}</th>`).join("")}</tr></thead>
+          <tbody>${renderDataRows(rows, headers.length)}</tbody>
+        </table>
       </div>
-      <div class="node-map">
-        ${nodes
-          .map(([name, detail, gate], index) => {
-            const arrow = index < nodes.length - 1 ? `<span class="edge"></span>` : "";
-            return `
-              <div class="node-wrap">
-                <div class="node ${topologyStatus(gate)}">
-                  <strong>${esc(name)}</strong>
-                  <small>${esc(detail)}</small>
+    </section>
+  `;
+}
+
+function renderDataPool(rows) {
+  return renderDataTable(
+    "本节点 txpool 快照",
+    ["节点", "观察时间", "状态", "Nonce", "说明"],
+    rows,
+  );
+}
+
+function renderDataEvents(events = []) {
+  return `
+    <section class="result-block">
+      <h3>Payload / Beacon 事件</h3>
+      <ol class="event-list focused-events">
+        ${events
+          .map(
+            (event) => `
+              <li>
+                <span class="time">${esc(event[0])}</span>
+                <div>
+                  <strong>${esc(event[2])}</strong>
+                  <p>${esc(event[1])} · ${esc(event[3])}</p>
                 </div>
-                ${arrow}
+              </li>
+            `,
+          )
+          .join("")}
+      </ol>
+    </section>
+  `;
+}
+
+function renderDataFinality(rows = []) {
+  return `
+    <section class="result-block">
+      <h3>确认级别</h3>
+      <div class="finality focused-finality">
+        ${rows
+          .map(
+            ([name, time, detail]) => `
+              <div class="finality-item">
+                <span>${esc(name)}</span>
+                <strong>${esc(time)}</strong>
+                <small>${esc(detail)}</small>
               </div>
-            `;
-          })
+            `,
+          )
           .join("")}
       </div>
     </section>
   `;
 }
 
-function renderPanels(tx) {
+function renderIntentEvidence(tx) {
+  const scenario = scenarioMeta(tx);
+  const rows = [
+    ["场景", scenario.title],
+    ["from", txField(tx, "from")],
+    ["to", txField(tx, "to")],
+    ["value", txField(tx, "value", "0")],
+    ["input / calldata", txField(tx, "input", "0x")],
+  ];
+  return `
+    ${renderDataKv("Web 准备表达的交易意图", rows)}
+    ${renderDataKv("DApp / 合约界面", tx.interface)}
+    ${renderDataKv("ABI / calldata 含义", tx.abi)}
+    <div class="stage-callout neutral">
+      <strong>此刻链上发生了什么？</strong>
+      <p>什么都没有。这里只有页面状态和一个待确认的业务动作。</p>
+    </div>
+  `;
+}
+
+function renderConstructEvidence(tx) {
+  const def = typeDef();
+  const warning = compatibilityLabel(tx, def).startsWith("Incompatible")
+    ? `<div class="compat-warning">${esc(compatibilityLabel(tx, def))}</div>`
+    : "";
+  const fields = activeKey === "live" ? tx.txFields : activityFields(tx, def);
+  return `
+    <section class="result-block type-lesson">
+      <div class="result-block-head">
+        <div>
+          <h3>选择一种交易 envelope 来理解编码</h3>
+          <p>切换只改变教学说明，不会重写已有交易或 Live 记录。</p>
+        </div>
+        <span class="compact-pill">Type ${esc(activeType)} · ${esc(def.name)}</span>
+      </div>
+      <div class="type-tabs compact-type-tabs">${renderTypeTabs()}</div>
+      ${warning}
+    </section>
+    ${renderDataKv("交易 envelope", envelopeRows(tx, def))}
+    ${renderDataKv("只读预检查 RPC", tx.preflight)}
+    ${renderDataKv("准备交给钱包的字段", fields)}
+  `;
+}
+
+function renderSignEvidence(tx) {
   const def = typeDef();
   return `
-    <section class="panes">
-      <article class="panel">
-        <div class="panel-head">
-          <span>01</span>
-          <h2>Raw Tx</h2>
-        </div>
-        ${renderKv("Envelope format", envelopeRows(tx, def))}
-        ${renderOptionalKv("DApp / contract interface", tx.interface)}
-        ${renderOptionalKv("ABI / calldata", tx.abi)}
-        ${renderKv("Preflight RPC", tx.preflight)}
-        ${renderKv("Active fields", activityFields(tx, def))}
-        ${renderKv("Local signing", signingRows(tx, def))}
-        <div class="hash-box ${rowClass(1)}">
-          <small>transaction hash</small>
-          <code>${esc(tx.txHash)}</code>
-        </div>
-      </article>
-
-      <article class="panel">
-        <div class="panel-head">
-          <span>02</span>
-          <h2>RPC / Txpool</h2>
-        </div>
-        ${renderKv("RPC calls", tx.rpc)}
-        ${renderKv("Broadcast path", renderBroadcastRows(tx))}
-        <div class="module">
-          <h3>txpool_contentFrom(sender)</h3>
-          ${renderPool(tx.txpool)}
-        </div>
-      </article>
-
-      <article class="panel">
-        <div class="panel-head">
-          <span>03</span>
-          <h2>Block Builder</h2>
-        </div>
-        <div class="module">
-          <h3>Engine API snooper</h3>
-          ${renderEventList(tx.builder)}
-        </div>
-        ${renderSimpleTable("Validator duties", ["Duty", "Actor", "Detail"], renderValidatorRows(tx))}
-        <div class="beacon-card ${rowClass(4)}">
-          <span>slot cadence</span>
-          <strong>4 seconds</strong>
-          <small>CL chooses the head; EL builds and validates the execution payload.</small>
-        </div>
-      </article>
-
-      <article class="panel">
-        <div class="panel-head">
-          <span>04</span>
-          <h2>EVM Execution</h2>
-        </div>
-        <div class="module">
-          <h3>Receipt</h3>
-          <table class="kv">
-            <tbody>${renderRows(tx.receipt, 2)}</tbody>
-          </table>
-        </div>
-        <div class="module">
-          <h3>debug_traceTransaction</h3>
-          ${renderTrace(tx.trace)}
-        </div>
-      </article>
-
-      <article class="panel">
-        <div class="panel-head">
-          <span>05</span>
-          <h2>Chain State</h2>
-        </div>
-        <div class="module">
-          <h3>Before / after diff</h3>
-          ${renderDiffs(tx.diffs)}
-        </div>
-        <div class="module">
-          <h3>Consensus status</h3>
-          ${renderFinality(tx.finality)}
-        </div>
-        <div class="module">
-          <h3>Flight record</h3>
-          ${renderJson(recordWithEnvelope(tx, def))}
-        </div>
-      </article>
-    </section>
+    ${renderDataKv("本场景记录到的签名边界", tx.signing)}
+    ${renderDataKv("所选 envelope 的签名结构", signingRows(tx, def))}
+    <div class="hash-box focused-hash">
+      <small>transaction hash</small>
+      <code>${esc(tx.txHash)}</code>
+    </div>
+    <div class="stage-callout neutral">
+      <strong>签名不等于发送</strong>
+      <p>raw tx 可以先保存在本地。只有下一步提交给 RPC 后，节点才会第一次看到它。</p>
+    </div>
   `;
 }
 
-function renderFooter() {
+function rpcSubmissionRows(tx) {
+  const rows = (tx.rpc || []).filter(([method]) => {
+    return /sendRawTransaction|sendTransaction|cast send|getTransactionByHash/i.test(method);
+  });
+  return rows.length ? rows : tx.rpc;
+}
+
+function renderRpcEvidence(tx) {
+  const rpcExample = JSON.stringify(
+    {
+      jsonrpc: "2.0",
+      method: "eth_sendRawTransaction",
+      params: ["<signed raw transaction>"],
+      id: 1,
+    },
+    null,
+    2,
+  );
   return `
-    <section class="devnet">
-      <div>
-        <p class="eyebrow">devnet wiring</p>
-        <h2>Real-node path is already mapped</h2>
-        <p>Use the included Kurtosis params to start geth + lighthouse nodes with RPC snooper enabled, then run the live transfer collector. If output/live-record.json exists, this UI loads it as the Live tab.</p>
-      </div>
-      <code>kurtosis run --enclave tx-flight-recorder github.com/ethpandaops/ethereum-package --args-file network_params.yaml</code>
+    <section class="result-block rpc-wire">
+      <h3>Web / Wallet 发出的 JSON-RPC</h3>
+      <pre class="json compact-json">${esc(rpcExample)}</pre>
+    </section>
+    ${renderDataKv("提交相关 RPC 与返回", rpcSubmissionRows(tx))}
+    ${renderDataTable("提交边界", ["参与方", "发生了什么"], renderBroadcastRows(tx).slice(0, 2))}
+    <div class="stage-callout warning">
+      <strong>拿到 txHash 仍不算上链</strong>
+      <p>它只表示 RPC 节点接受了这次提交；交易仍可能等待、被替换、被丢弃或最终执行失败。</p>
+    </div>
+  `;
+}
+
+function renderNodeEvidence(tx) {
+  return `
+    ${renderDataTable("节点检查与传播", ["环节", "节点动作"], renderBroadcastRows(tx).slice(1, 4))}
+    ${renderDataPool(tx.txpool)}
+    <div class="stage-callout neutral">
+      <strong>pending 与 queued 的区别</strong>
+      <p>pending 表示 nonce 连续、当前可执行；queued 常见于前面缺 nonce。每台节点都有自己的观察结果。</p>
+    </div>
+  `;
+}
+
+function proposerDutyRows(tx) {
+  return renderValidatorRows(tx).filter(([duty]) => !/attestation/i.test(duty));
+}
+
+function attestationRows(tx) {
+  return renderValidatorRows(tx).filter(([duty]) => /attestation/i.test(duty));
+}
+
+function renderPayloadEvidence(tx) {
+  const payloadEvents = (tx.builder || []).filter((event) => event[2] !== "finality_checkpoints");
+  return `
+    ${renderDataEvents(payloadEvents)}
+    ${renderDataTable("Proposer duties", ["职责", "执行者", "具体动作"], proposerDutyRows(tx))}
+    <div class="stage-callout neutral">
+      <strong>谁真正“打包”？</strong>
+      <p>Execution Client 从 txpool 选交易并构建 payload；Consensus Client 组织 Beacon Block；Validator Client 负责签名与提议。</p>
+    </div>
+  `;
+}
+
+function renderExecuteEvidence(tx) {
+  return `
+    ${renderDataKv("Transaction receipt", tx.receipt)}
+    ${renderDataTable("debug_traceTransaction", ["执行步骤", "Gas", "含义"], tx.trace)}
+    <div class="stage-callout neutral">
+      <strong>status=0 也可能已经上链</strong>
+      <p>Revert 会回滚合约内部状态，但交易可以已经被区块收录，sender 的 nonce 与实际 gas 仍会消耗。</p>
+    </div>
+  `;
+}
+
+function renderChainEvidence(tx) {
+  return `
+    ${renderDataTable("执行前后状态变化", ["状态", "之前", "之后", "原因"], tx.diffs)}
+    ${renderDataTable("Attestations 与共识推进", ["职责", "执行者", "具体动作"], attestationRows(tx))}
+    ${renderDataFinality(tx.finality)}
+    <details class="raw-record">
+      <summary>查看完整 Flight Record JSON</summary>
+      ${renderJson(recordWithEnvelope(tx, typeDef()))}
+    </details>
+  `;
+}
+
+function renderStageEvidence(tx) {
+  return [
+    renderIntentEvidence,
+    renderConstructEvidence,
+    renderSignEvidence,
+    renderRpcEvidence,
+    renderNodeEvidence,
+    renderPayloadEvidence,
+    renderExecuteEvidence,
+    renderChainEvidence,
+  ][stage](tx);
+}
+
+function renderArtifactCard(artifact, role) {
+  return `
+    <article class="artifact-card artifact-${esc(role)}">
+      <header>
+        <span>${esc(role === "input" ? "INPUT · 进入本步" : "OUTPUT · 离开本步")}</span>
+        <em>${esc(artifact.kind)}</em>
+      </header>
+      <h3>${esc(artifact.title)}</h3>
+      <dl class="artifact-fields">
+        ${(artifact.rows || [])
+          .map(
+            ([name, value]) => `
+              <div>
+                <dt>${esc(name)}</dt>
+                <dd><code>${esc(value)}</code></dd>
+              </div>
+            `,
+          )
+          .join("")}
+      </dl>
+      <p class="artifact-note">${esc(artifact.note)}</p>
+    </article>
+  `;
+}
+
+function renderOperationLane(operations) {
+  return `
+    <section class="operation-lane">
+      <header>
+        <span>TRANSFORM</span>
+        <h3>中间进行了哪些操作</h3>
+      </header>
+      <ol class="transform-operations">
+        ${operations
+          .map(
+            (operation, index) => `
+              <li>
+                <span class="operation-index">${index + 1}</span>
+                <div>
+                  <strong>${esc(operation.title)}</strong>
+                  <p>${esc(operation.detail)}</p>
+                  <div class="operation-result">
+                    <span>产生 / 得到</span>
+                    <code>${esc(operation.result)}</code>
+                  </div>
+                </div>
+              </li>
+            `,
+          )
+          .join("")}
+      </ol>
     </section>
   `;
 }
 
-function render() {
+function renderTransformationBoard(model) {
+  return `
+    <section class="transformation-board" aria-label="本步骤输入、内部处理与输出">
+      ${renderArtifactCard(model.input, "input")}
+      ${renderOperationLane(model.operations)}
+      ${renderArtifactCard(model.output, "output")}
+    </section>
+    <div class="transformation-explanation">
+      <span>为什么输出会变成这样</span>
+      <p>${esc(model.explanation)}</p>
+    </div>
+  `;
+}
+
+function renderJourneySidebar() {
+  return `
+    <aside class="journey-sidebar">
+      <div class="journey-sidebar-head">
+        <p class="eyebrow">交易旅程</p>
+        <h2>一次只看一步</h2>
+        <p>点击步骤，右侧只展示这一段的角色、输入、动作和结果。</p>
+      </div>
+      <nav class="journey-steps" aria-label="交易执行步骤">
+        ${FLOW_STEPS.map((item, index) => {
+          const status = index < stage ? "is-done" : index === stage ? "is-current" : "is-upcoming";
+          const current = index === stage ? 'aria-current="step"' : "";
+          return `
+            <button class="journey-step ${status}" data-journey-stage="${index}" ${current}>
+              <span class="journey-index">${index + 1}</span>
+              <span class="journey-step-copy">
+                <strong>${esc(item.label)}</strong>
+                <small>${esc(item.detail)}</small>
+                <em>${esc(item.actor)}</em>
+              </span>
+            </button>
+          `;
+        }).join("")}
+      </nav>
+    </aside>
+  `;
+}
+
+function renderJourneyFocus(tx) {
+  const item = FLOW_STEPS[stage];
+  const evidence = journeyEvidence();
+  const scenario = scenarioMeta(tx);
+  const model = transformationModel(tx);
+  return `
+    <article class="journey-focus">
+      <header class="journey-focus-head">
+        <div class="focus-kicker">
+          <span>第 ${stage + 1} / ${FLOW_STEPS.length} 步</span>
+          <span class="evidence-badge ${esc(evidence.tone)}">${esc(evidence.label)}</span>
+        </div>
+        <h2>${esc(item.label)}</h2>
+        <p>${esc(item.summary)}</p>
+        <div class="artifact-transition" aria-label="输入输出类型">
+          <div>
+            <small>INPUT TYPE</small>
+            <strong>${esc(model.input.kind)}</strong>
+          </div>
+          <span>经过 ${model.operations.length} 个内部操作 →</span>
+          <div>
+            <small>OUTPUT TYPE</small>
+            <strong>${esc(model.output.kind)}</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="transformation-shell">
+        <div class="transformation-shell-head">
+          <div>
+            <p class="eyebrow">input → transform → output</p>
+            <h2>${esc(scenario.label)} · ${esc(item.label)}</h2>
+          </div>
+          <span class="compact-pill">${esc(activeKey === "live" ? "Live record" : "Snapshot")}</span>
+        </div>
+        ${renderTransformationBoard(model)}
+      </section>
+
+      <div class="evidence-note ${esc(evidence.tone)}">
+        <strong>这部分数据从哪里来</strong>
+        <p>${esc(evidence.note)}</p>
+      </div>
+
+      <details class="evidence-drawer" id="step-result">
+        <summary>
+          <span>展开原始字段与节点记录</span>
+          <small>RPC / txpool / receipt / trace / state diff</small>
+        </summary>
+        <div class="step-result-body">${renderStageEvidence(tx)}</div>
+      </details>
+
+      <footer class="focus-nav">
+        <button class="control" data-journey-nav="prev" ${stage === 0 ? "disabled" : ""}>← 上一步</button>
+        <span>${stage + 1} / ${FLOW_STEPS.length}</span>
+        <button class="control primary" data-journey-nav="next" ${stage === FLOW_STEPS.length - 1 ? "disabled" : ""}>下一步 →</button>
+      </footer>
+    </article>
+  `;
+}
+
+function renderJourneyFooter() {
+  return `
+    <section class="devnet journey-devnet">
+      <div>
+        <p class="eyebrow">观察边界</p>
+        <h2>页面是逐步解释器，不是区块链节点</h2>
+        <p>Live 会加载已有真实交易记录；当前高容量 RPC snooping 保持关闭。需要完整 Engine API 证据时，应使用短时、受控且有容量上限的抓取。</p>
+      </div>
+      <code>Web → Wallet → RPC → Execution Node → Txpool → Proposer → EVM → Chain</code>
+    </section>
+  `;
+}
+
+function renderWalkthrough() {
   const tx = TXS[activeKey];
   const def = typeDef();
+  const scenario = scenarioMeta(tx);
+  const sourceLabel = activeKey === "live" ? "Live · 历史实测" : "Snapshot · 教学示意";
   app.innerHTML = `
     <header class="topbar">
       <div>
         <strong>Tx Flight Recorder</strong>
-        <span>RPC / txpool / Engine API / validator / state</span>
+        <span>从 Web 发起到上链确认</span>
       </div>
-      <div class="mode-pill">snapshot | Type ${esc(activeType)} ${esc(def.name)}</div>
+      <div class="mode-pill">Step ${stage + 1}/${FLOW_STEPS.length} · Type ${esc(activeType)} ${esc(def.name)}</div>
     </header>
 
-    <main>
-      ${renderTopology(tx)}
-
-      <section class="controls">
-        <div class="tabs">${renderTabs()}</div>
-        <div class="player">
-          <button class="control" data-action="reset">Reset</button>
-          <button class="control primary" data-action="play">${timer ? "Pause" : "Play"}</button>
+    <main class="walkthrough-main">
+      <section class="walkthrough-intro">
+        <div>
+          <p class="eyebrow">guided transaction walkthrough</p>
+          <h1>${esc(scenario.title)}</h1>
+          <p>${esc(scenario.subtitle)}</p>
+        </div>
+        <div class="source-summary">
+          <span>${esc(sourceLabel)}</span>
+          <strong>${esc(tx.txHash)}</strong>
+          <small>切换左侧步骤时，始终围绕同一个交易场景观察。</small>
         </div>
       </section>
 
-      ${renderTypeStrip(tx)}
+      <section class="scenario-bar">
+        <div>
+          <small>选择交易场景</small>
+          <div class="tabs">${renderJourneyTabs()}</div>
+        </div>
+        <div class="player">
+          <button class="control" data-journey-action="reset">回到第一步</button>
+          <button class="control primary" data-journey-action="play">${timer ? "暂停播放" : "自动播放"}</button>
+        </div>
+      </section>
 
-      <section class="stagebar">${renderStageControls()}</section>
+      <section class="walkthrough-layout">
+        ${renderJourneySidebar()}
+        ${renderJourneyFocus(tx)}
+      </section>
 
-      ${renderPanels(tx)}
-      ${renderFooter()}
+      ${renderJourneyFooter()}
     </main>
   `;
-
-  bindEvents();
+  bindJourneyEvents();
 }
 
-function bindEvents() {
+function stopJourneyTimer() {
+  if (!timer) return;
+  window.clearInterval(timer);
+  timer = null;
+}
+
+function startJourneyTimer() {
+  if (timer) {
+    stopJourneyTimer();
+    renderWalkthrough();
+    return;
+  }
+  if (stage >= FLOW_STEPS.length - 1) stage = 0;
+  timer = window.setInterval(() => {
+    if (stage >= FLOW_STEPS.length - 1) {
+      stopJourneyTimer();
+      renderWalkthrough();
+      return;
+    }
+    stage += 1;
+    renderWalkthrough();
+  }, 1600);
+  renderWalkthrough();
+}
+
+function bindJourneyEvents() {
   document.querySelectorAll("[data-tx]").forEach((button) => {
     button.addEventListener("click", () => {
       activeKey = button.dataset.tx;
-      stage = 6;
-      stopTimer();
-      render();
+      stage = 0;
+      stopJourneyTimer();
+      renderWalkthrough();
     });
   });
 
-  document.querySelectorAll("[data-stage]").forEach((button) => {
+  document.querySelectorAll("[data-journey-stage]").forEach((button) => {
     button.addEventListener("click", () => {
-      stage = Number(button.dataset.stage);
-      stopTimer();
-      render();
+      stage = Number(button.dataset.journeyStage);
+      stopJourneyTimer();
+      renderWalkthrough();
     });
   });
 
   document.querySelectorAll("[data-type]").forEach((button) => {
     button.addEventListener("click", () => {
       activeType = button.dataset.type;
-      stopTimer();
-      render();
+      stopJourneyTimer();
+      renderWalkthrough();
     });
   });
 
-  document.querySelectorAll("[data-action]").forEach((button) => {
+  document.querySelectorAll("[data-journey-action]").forEach((button) => {
     button.addEventListener("click", () => {
-      if (button.dataset.action === "reset") {
+      if (button.dataset.journeyAction === "reset") {
         stage = 0;
-        stopTimer();
-        render();
+        stopJourneyTimer();
+        renderWalkthrough();
+      } else {
+        startJourneyTimer();
       }
-      if (button.dataset.action === "play") {
-        if (timer) {
-          stopTimer();
-          render();
-        } else {
-          stage = 0;
-          timer = window.setInterval(() => {
-            stage += 1;
-            if (stage >= STAGES.length - 1) {
-              stage = STAGES.length - 1;
-              stopTimer();
-            }
-            render();
-          }, 950);
-          render();
-        }
-      }
+    });
+  });
+
+  document.querySelectorAll("[data-journey-nav]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const delta = button.dataset.journeyNav === "next" ? 1 : -1;
+      stage = Math.max(0, Math.min(FLOW_STEPS.length - 1, stage + delta));
+      stopJourneyTimer();
+      renderWalkthrough();
     });
   });
 }
 
-function stopTimer() {
-  if (timer) {
-    window.clearInterval(timer);
-    timer = null;
-  }
-}
-
-async function loadLiveRecord() {
+async function loadLiveRecordWalkthrough() {
   try {
     const response = await fetch(`${LIVE_RECORD_PATH}?t=${Date.now()}`, { cache: "no-store" });
     if (!response.ok) return;
-
     const record = await response.json();
     if (!record?.uiTx?.txHash) return;
-
     TXS.live = record.uiTx;
-    if (activeKey !== "live") {
-      activeKey = "live";
-      stage = 6;
-    }
-    render();
+    activeKey = "live";
+    stage = 0;
+    renderWalkthrough();
   } catch {
     // Direct file opens and first-run checkouts usually do not have live output yet.
   }
 }
 
-render();
-loadLiveRecord();
+renderWalkthrough();
+loadLiveRecordWalkthrough();
