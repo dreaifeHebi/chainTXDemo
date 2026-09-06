@@ -1,4 +1,4 @@
-name: Check and deploy Cloudflare Pages
+name: Check Cloudflare Pages build
 
 on:
   push:
@@ -34,38 +34,5 @@ jobs:
           path: dist
           if-no-files-found: error
 
-  deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
-    needs: check
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      WRANGLER_SEND_METRICS: 'false'
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - name: Verify deploy credentials
-        run: |
-          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Missing CLOUDFLARE_API_TOKEN repository secret'; exit 1; }
-          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo 'Missing CLOUDFLARE_ACCOUNT_ID repository secret'; exit 1; }
-      - run: npm ci
-      - uses: actions/download-artifact@v4
-        with:
-          name: site
-          path: dist
-      - name: Ensure Pages project
-        run: node scripts/cloudflare-setup.mjs project
-      - name: Deploy checked assets
-        run: npx wrangler pages deploy dist --project-name chaintxdemo --branch master
-      - name: Attach custom domain and DNS
-        run: node scripts/cloudflare-setup.mjs domain
-      - name: Check Pages deployment
-        run: |
-          curl --fail --silent --show-error --retry 8 --retry-delay 5 --retry-all-errors https://chaintxdemo.pages.dev/ -o /tmp/deployed-site.html
-          grep -q '交易上链导览' /tmp/deployed-site.html
-          echo '### Deployed to https://chaintxdemo.dreaifehebi.com (initial TLS activation may take a few minutes)' >> "$GITHUB_STEP_SUMMARY"
+      - name: Deployment ownership
+        run: echo 'Cloudflare Pages Git integration independently runs the same checks and deploys master. No Cloudflare token is required in GitHub Actions.' >> "$GITHUB_STEP_SUMMARY"

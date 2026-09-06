@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/app.js && node --check src/infra-lab.js && node --check scripts/run-live-transfer.mjs && node --check scripts/build-site.mjs && node --check scripts/cloudflare-setup.mjs && bash -n scripts/start-anvil-devnet.sh",
+    "check": "node --check src/app.js && node --check src/infra-lab.js && node --check scripts/run-live-transfer.mjs && node --check scripts/build-site.mjs && bash -n scripts/start-anvil-devnet.sh",
     "test": "node --test scripts/test-rpc-connection.mjs",
     "build": "node scripts/build-site.mjs",
     "deploy": "npm run build && wrangler pages deploy dist --project-name chaintxdemo --branch master"

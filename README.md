@@ -288,21 +288,21 @@ are excluded. A `404.html` prevents Pages from returning the app HTML for a
 missing local recording. The public site starts with the teaching examples;
 connect your RPC and wallet to start an interactive experiment.
 
-The GitHub Actions workflow checks and builds pull requests. On a push to
-`master` (or a manual run on `master`), it deploys the checked artifact with
-the locked Wrangler version, creates the Pages project if absent, and attaches
-the custom domain and CNAME. Existing DNS pointing elsewhere is never replaced.
+GitHub Actions checks/tests/builds pull requests and pushes. Cloudflare Pages
+is directly connected to `dreaifeHebi/chainTXDemo` through the Cloudflare GitHub
+App and automatically deploys each push to `master`. It independently runs
+`npm ci && npm run check && npm test && npm run build` before publishing `dist`;
+a failed check blocks publication. No Cloudflare token is needed in GitHub
+Actions. Preview deployments are disabled in Pages.
 
-Configure these repository Actions secrets once:
+Pages settings: repository root, Node.js 22, production branch `master`, output
+directory `dist`. Manage or retry deployment in Cloudflare → Workers & Pages →
+chaintxdemo. Manual local deployment can use `npx wrangler login --device` then
+`npm run deploy` (select the account containing the project if prompted).
 
-| Secret | Value |
-| --- | --- |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account containing the Pages project |
-| `CLOUDFLARE_API_TOKEN` | Token with Account / Cloudflare Pages / Edit, plus Zone / Zone / Read and Zone / DNS / Edit scoped to `dreaifehebi.com` for domain setup |
-
-After adding secrets, use Actions → Check and deploy Cloudflare Pages → Run
-workflow. First-time DNS and certificate activation can take several minutes;
-the workflow reports the domain status. The Pages hostname is
+The custom domain is associated through Pages → Custom domains. Its DNS CNAME
+must point `chaintxdemo.dreaifehebi.com` to `chaintxdemo.pages.dev`. First-time DNS
+and certificate activation can take several minutes. The Pages hostname is
 `https://chaintxdemo.pages.dev`.
 
 The deployed site serves the frontend, not an Anvil instance or an RPC relay.
