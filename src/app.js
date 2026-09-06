@@ -2346,7 +2346,7 @@ function renderInfraDrawer() {
             <div><span>03</span><h3>发送测试交易</h3></div>
             <em>${esc(lab.experiment?.status || "idle")}</em>
           </div>
-          <p>支持本机、局域网或私有网络上的 Anvil（31337）/开发网（20230618），以及 Sepolia、Hoodi。钱包确认后，页面通过选定 RPC 观察 txpool、receipt、block 与 finality。</p>
+          <p>支持自定义 EVM 链和 RPC 地址，钱包与 RPC 的 chainId 一致即可发起交易。钱包确认后，页面通过选定 RPC 观察 txpool、receipt、block 与 finality。</p>
           <label>
             <span>To</span>
             <input id="infra-tx-to" value="${esc(lab.experiment?.to || "0x000000000000000000000000000000000000b0b0")}" autocomplete="off" spellcheck="false" />

@@ -51,27 +51,22 @@ test("RPC validation failures release the UI and allow a subsequent HTTP connect
   }
 });
 
-test("send policy permits private development RPCs and rejects mainnet even through loopback", async () => {
+test("custom and public chains reach wallet confirmation; mismatched chains do not", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;
   const cases = [
-    ["http://192.168.1.5:8545", "0x7a69", true],
-    ["http://127.0.0.1:18545", "0x7a69", true],
-    ["http://10.0.0.5:8545", "0x134b1da", true],
-    ["http://172.16.0.5:8545", "0x7a69", true],
-    ["http://100.92.194.31:8545", "0x7a69", true],
-    ["http://[fd00::5]:8545", "0x7a69", true],
-    ["https://rpc.example.org", "0xaa36a7", true],
-    ["https://rpc.example.org", "0x88bb0", true],
-    ["http://127.0.0.1:8545", "0x1", false],
-    ["http://192.168.1.5:8545", "0x1", false],
-    ["http://192.168.1.5:8545", "0x1234", false],
-    ["http://172.32.0.5:8545", "0x7a69", false],
-    ["https://rpc.example.org", "0x7a69", false],
-    ["http://192.168.1.5.example.org:8545", "0x7a69", false],
+    ["http://192.168.1.5:8545", "0x7a6a", "0x7a6a", true], // 31338
+    ["http://127.0.0.1:18545", "0x7a6a", "0x7a6a", true],
+    ["https://rpc.example.org", "0x7a6a", "0x7a6a", true],
+    ["https://rpc.example.org", "0xaa36a7", "0xaa36a7", true],
+    ["https://rpc.example.org", "0x88bb0", "0x88bb0", true],
+    ["https://rpc.example.org", "0x1", "0x1", true],
+    ["http://192.168.1.5:8545", "0x1234", "0x1234", true],
+    ["https://rpc.example.org", "0x7a6a", "0x7a69", false],
+    ["http://127.0.0.1:18545", "0x1", "0xaa36a7", false],
   ];
   try {
-    for (const [rpcUrl, chainId, allowed] of cases) {
+    for (const [rpcUrl, chainId, walletChainId, allowed] of cases) {
       const account = "0x0000000000000000000000000000000000000001";
       let sendCalls = 0;
       const methods = [];
@@ -79,7 +74,7 @@ test("send policy permits private development RPCs and rejects mainnet even thro
         on() {},
         async request({ method }) {
           if (method === "eth_requestAccounts") return [account];
-          if (method === "eth_chainId") return chainId;
+          if (method === "eth_chainId") return walletChainId;
           if (method === "eth_sendTransaction") {
             sendCalls++;
             // Stop at the wallet boundary: tests never broadcast a transaction.
@@ -104,7 +99,7 @@ test("send policy permits private development RPCs and rejects mainnet even thro
       await lab.sendExperiment({ to: account, valueEth: "0.001", data: "0x" });
       assert.equal(sendCalls, allowed ? 1 : 0, `${rpcUrl}, ${chainId}`);
       assert.equal(methods.includes("eth_estimateGas"), allowed);
-      assert.match(lab.snapshot().error, allowed ? /用户在钱包中拒绝/ : /当前 chainId=/);
+      assert.match(lab.snapshot().error, allowed ? /用户在钱包中拒绝/ : /chainId 与 Execution RPC 不一致/);
       assert.equal(lab.snapshot().busy, "");
     }
   } finally {

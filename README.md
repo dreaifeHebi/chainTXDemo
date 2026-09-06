@@ -209,11 +209,10 @@ chain ID: 31337
 currency: ETH
 ```
 
-The same development chain can be used through a LAN/private-network address
-or a forwarded loopback port. Sending is enabled for Anvil (chain ID 31337)
-and the demo PoS devnet (20230618) on loopback, RFC1918 IPv4, private mesh
-addresses (100.64.0.0/10), and IPv6 unique-local addresses. Sepolia and Hoodi
-are also supported. A loopback URL alone does not permit mainnet transactions.
+Sending supports arbitrary EVM chain IDs (including custom IDs such as 31338)
+and HTTP(S) RPC addresses. There is no chain or network-address allowlist.
+The connected wallet and observation RPC must have matching chain IDs, and
+each transaction is submitted through the wallet's confirmation flow.
 
 Never reuse Anvil's public development keys on a real network. In the page,
 open `Infrastructure Lab`, connect the RPC and wallet, confirm their chain IDs

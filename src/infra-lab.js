@@ -44,32 +44,6 @@ function displayRpcUrl(value) {
   }
 }
 
-function isLoopbackUrl(value) {
-  try {
-    const host = new URL(value).hostname;
-    return host === "127.0.0.1" || host === "localhost" || host === "[::1]";
-  } catch {
-    return false;
-  }
-}
-
-function isPrivateRpcUrl(value) {
-  if (isLoopbackUrl(value)) return true;
-  try {
-    const host = new URL(value).hostname;
-    // IPv6 unique-local addresses (including private mesh networks).
-    if (/^\[f[cd][0-9a-f]{2}:/i.test(host)) return true;
-    if (!/^\d+\.\d+\.\d+\.\d+$/.test(host)) return false;
-    const [a, b] = host.split(".").map(Number);
-    return a === 127 || a === 10 ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127);
-  } catch {
-    return false;
-  }
-}
-
 function validateHttpUrl(value, name) {
   let parsed;
   try {
@@ -372,13 +346,6 @@ export function createInfraLab(onChange = () => {}) {
     emit();
   }
 
-  function validateExperimentChain() {
-    const chain = KNOWN_CHAINS[state.rpc.chainId];
-    if (chain?.kind === "testnet") return;
-    if (chain?.kind === "local" && isPrivateRpcUrl(state.rpc.url)) return;
-    throw new Error("实验发送支持本机或私有网络上的 Anvil（31337）/开发网（20230618），以及 Sepolia、Hoodi。当前 chainId=" + hexToDecimal(state.rpc.chainId) + "，请确认 RPC 和钱包连接的是测试链。");
-  }
-
   async function observeFinality(experiment) {
     const target = experiment.receipt?.blockNumber;
     if (!target) return;
@@ -479,7 +446,6 @@ export function createInfraLab(onChange = () => {}) {
       if (state.rpc.status !== "connected") throw new Error("请先连接 Execution RPC");
       if (state.wallet.status !== "connected" || !provider?.request) throw new Error("请先连接浏览器钱包");
       if (state.wallet.chainId !== state.rpc.chainId) throw new Error("钱包 chainId 与 Execution RPC 不一致");
-      validateExperimentChain();
       const recipient = normalizeAddress(to, "to");
       const value = parseEther(valueEth);
       const calldata = normalizeData(data);
