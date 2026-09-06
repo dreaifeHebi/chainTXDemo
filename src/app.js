@@ -1,3 +1,5 @@
+import { createInfraLab, hexToDecimal } from "./infra-lab.js";
+
 const FLOW_STEPS = [
   {
     id: "intent",
@@ -897,9 +899,11 @@ let activeKey = "transfer";
 let activeType = "2";
 let stage = 0;
 let timer = null;
+let lastInfraEventCount = 0;
 
 const app = document.querySelector("#app");
 const LIVE_RECORD_PATH = "./output/live-record.json";
+const infraLab = createInfraLab(handleInfraLabChange);
 
 function esc(value) {
   return String(value)
@@ -908,6 +912,167 @@ function esc(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function experimentEvent(experiment, matcher) {
+  const events = experiment?.events || [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (matcher.test(events[index].action)) return events[index];
+  }
+  return null;
+}
+
+function buildExperimentUiTx(labState) {
+  const experiment = labState.experiment;
+  const tx = experiment.tx || {};
+  const receipt = experiment.receipt || {};
+  const block = experiment.block || {};
+  const txpoolEvent = experimentEvent(experiment, /txpool/i);
+  const receiptEvent = experimentEvent(experiment, /Receipt/i);
+  const broadcastEvent = experimentEvent(experiment, /wallet returned/i);
+  const latestEvent = experimentEvent(experiment, /latest block/i);
+  const trace = experiment.trace;
+  const txpool = experiment.txpool || { status: "waiting", detail: "awaiting txpool observation" };
+  const receiptRows = receipt.blockNumber
+    ? [
+        ["blockNumber", `${receipt.blockNumber} / ${hexToDecimal(receipt.blockNumber)}`, 5],
+        ["transactionIndex", receipt.transactionIndex || "unknown", 5],
+        ["status", receipt.status || "unknown", 5],
+        ["gasUsed", receipt.gasUsed ? `${receipt.gasUsed} / ${hexToDecimal(receipt.gasUsed)}` : "unknown", 5],
+        ["effectiveGasPrice", receipt.effectiveGasPrice || "unknown", 5],
+        ["logs", Array.isArray(receipt.logs) ? String(receipt.logs.length) : "unknown", 5],
+      ]
+    : [["receipt", "等待 eth_getTransactionReceipt", 5]];
+  const traceRows = trace
+    ? [
+        [trace.type || "CALL", trace.gasUsed || "-", trace.error || `from ${trace.from || experiment.from} to ${trace.to || experiment.to}`, 5],
+        [trace.error ? "ERROR" : "RETURN", "0", trace.output || "callTracer completed", 5],
+      ]
+    : [["debug_traceTransaction", "-", receipt.blockNumber ? "RPC 不支持或未启用 debug API" : "等待 receipt", 5]];
+  const finalityRows = [
+    ["latest", latestEvent?.at || "waiting", receipt.blockNumber ? `receipt in ${receipt.blockNumber}` : "waiting for inclusion", 5],
+    ["safe", experiment.safeAt || "waiting", experiment.safeAt ? "safe block covers transaction" : "waiting / unsupported", 6],
+    ["finalized", experiment.finalizedAt || "waiting", experiment.finalizedAt ? "finalized block covers transaction" : "waiting / unsupported", 6],
+  ];
+
+  return {
+    label: "Experiment",
+    title: "Interactive Tx: wallet to chain",
+    subtitle: "A transaction constructed by this page, authorized by an EIP-1193 wallet, and observed through the selected RPC.",
+    type: "experiment",
+    txHash: experiment.txHash || "awaiting-wallet-signature",
+    txFields: [
+      ["type", tx.type || "wallet-selected", 0],
+      ["chainId", `${experiment.chainId} / ${hexToDecimal(experiment.chainId)}`, 0],
+      ["nonce", tx.nonce || experiment.preflight.nonce || "waiting", 0],
+      ["from", experiment.from, 0],
+      ["to", experiment.to, 0],
+      ["value", `${experiment.valueHex} / ${experiment.valueWei} wei`, 0],
+      ["input", experiment.data, 0],
+      ["gas", tx.gas || experiment.preflight.gas || "waiting", 0],
+      ["maxFeePerGas", tx.maxFeePerGas || "wallet-selected", 0],
+      ["maxPriorityFeePerGas", tx.maxPriorityFeePerGas || experiment.preflight.priorityFee || "wallet-selected", 0],
+    ],
+    interface: [
+      ["DApp action", "Send test ETH transfer", 0],
+      ["Execution RPC observer", experiment.rpcDisplayUrl, 0],
+      ["wallet", "EIP-1193 provider; private key never exposed", 1],
+    ],
+    preflight: [
+      ["eth_chainId", experiment.chainId, 0],
+      ["eth_getTransactionCount(pending)", experiment.preflight.nonce || "waiting", 0],
+      ["eth_estimateGas", experiment.preflight.gas || "waiting", 0],
+      ["eth_maxPriorityFeePerGas", experiment.preflight.priorityFee || "unavailable", 0],
+      ["sender balance before", experiment.beforeFromBalance || "unknown", 0],
+      ["recipient balance before", experiment.beforeToBalance || "unknown", 0],
+    ],
+    signing: [
+      ["wallet API", "eth_sendTransaction", 1],
+      ["authorization", broadcastEvent ? "user approved in wallet" : "awaiting wallet confirmation", 1],
+      ["private key", "never exposed to this page", 1],
+      ["raw transaction", "wallet does not expose signed raw bytes", 1],
+      ["transaction hash", experiment.txHash || "waiting", 1],
+    ],
+    rpc: (experiment.events || [])
+      .filter((event) => event.stage >= 1 && event.stage <= 6)
+      .map((event) => [event.action, `${event.at} · ${event.result}`, Math.min(event.stage, 5)]),
+    broadcast: [
+      ["Web", "constructs the transaction request and preflights through selected RPC", 0],
+      ["Browser wallet", "shows user confirmation, signs internally, and broadcasts via its active chain provider", 2],
+      ["Selected RPC", "independently observes txHash, txpool availability, receipt, and block", 3],
+      ["Boundary", "selected observer RPC may differ from the wallet's broadcast endpoint even when chainId matches", 4],
+    ],
+    txpool: [
+      [
+        labState.rpc.displayUrl || "selected execution RPC",
+        txpoolEvent?.at || "waiting",
+        txpool.status || "unknown",
+        experiment.preflight.nonce ? `nonce ${hexToDecimal(experiment.preflight.nonce)}` : "nonce waiting",
+        txpool.detail || "waiting for txpool_contentFrom",
+        3,
+      ],
+    ],
+    builder: [
+      [
+        receiptEvent?.at || "waiting",
+        labState.rpc.displayUrl || "execution RPC",
+        receipt.blockNumber ? "eth_getBlockByHash" : "awaiting inclusion",
+        block.number ? `execution block ${hexToDecimal(block.number)}` : "block unavailable",
+        4,
+      ],
+      [
+        "context",
+        labState.rpc.beaconUrl ? "Beacon API" : "not configured",
+        labState.rpc.beaconUrl ? "beacon head / finality" : "validator internals unavailable",
+        labState.rpc.beaconUrl
+          ? `head slot ${labState.rpc.beaconHead || "unknown"}, finalized epoch ${labState.rpc.finalizedEpoch || "unknown"}`
+          : "Execution RPC alone cannot expose proposer or Engine API actions",
+        4,
+      ],
+    ],
+    receipt: receiptRows,
+    trace: traceRows,
+    diffs: [
+      ["sender.balance", experiment.beforeFromBalance || "unknown", experiment.afterFromBalance || "waiting", "value + gas", 6],
+      ["recipient.balance", experiment.beforeToBalance || "unknown", experiment.afterToBalance || "waiting", `${experiment.valueWei} wei transfer`, 6],
+      ["sender.nonce", experiment.preflight.nonce || "unknown", tx.nonce ? `${hexToDecimal(tx.nonce)} → ${BigInt(tx.nonce) + 1n}` : "waiting", "nonce consumed after inclusion", 6],
+      ["block.stateRoot", "-", block.stateRoot || "waiting", "post-state root", 6],
+    ],
+    finality: finalityRows,
+    record: {
+      activityType: "interactive_wallet_transfer",
+      source: "browser-infra-lab",
+      chainId: experiment.chainId,
+      txHash: experiment.txHash || null,
+      rpc: experiment.rpcDisplayUrl,
+      blockNumber: receipt.blockNumber || null,
+      blockHash: receipt.blockHash || null,
+      transactionIndex: receipt.transactionIndex || null,
+      status: receipt.status || null,
+      gasUsed: receipt.gasUsed || null,
+      from: experiment.from,
+      to: experiment.to,
+      valueWei: experiment.valueWei,
+      safeAt: experiment.safeAt || null,
+      finalizedAt: experiment.finalizedAt || null,
+      observationEvents: experiment.events,
+    },
+  };
+}
+
+function handleInfraLabChange(labState) {
+  const experiment = labState.experiment;
+  if (experiment) {
+    TXS.experiment = buildExperimentUiTx(labState);
+    const eventCount = experiment.events?.length || 0;
+    if (eventCount > lastInfraEventCount || activeKey === "experiment") {
+      activeKey = "experiment";
+      stage = experiment.stage;
+      stopJourneyTimer();
+    }
+    lastInfraEventCount = eventCount;
+  }
+  renderWalkthrough();
 }
 
 function renderBroadcastRows(tx) {
@@ -1087,6 +1252,11 @@ const SCENARIO_META = {
     title: "真实记录：本地 ETH 转账",
     subtitle: "这是一笔曾经提交给本地 PoS devnet 的真实交易记录，并非刚刚生成的新交易。",
   },
+  experiment: {
+    label: "交互实验",
+    title: "实时实验：钱包发起的交易",
+    subtitle: "由当前页面构造、浏览器钱包授权，并通过选定 Execution RPC 实时观察的交易。",
+  },
 };
 
 function scenarioMeta(tx) {
@@ -1109,6 +1279,30 @@ function renderJourneyTabs() {
 
 function journeyEvidence() {
   if (activeKey === "live") return LIVE_STEP_EVIDENCE[stage];
+  if (activeKey === "experiment") {
+    const lab = infraLab.snapshot();
+    const experiment = lab.experiment;
+    const event = experiment?.events?.find((item) => item.stage === stage);
+    const notes = [
+      "Web 表单输入由当前页面实时记录。",
+      "chainId、nonce、gas 与余额来自当前连接的 Execution RPC。",
+      "钱包确认与 txHash 可观察；私钥、签名字段和 raw bytes 由钱包隔离，不暴露给页面。",
+      "txHash 来自钱包 Provider；钱包实际广播端点可能与本页选择的观察 RPC 不同。",
+      experiment?.txpool?.status === "unavailable"
+        ? "当前 RPC 不开放 txpool namespace，因此只能继续通过 txHash / receipt 观察。"
+        : "txpool_contentFrom 来自当前选择的 Execution RPC。",
+      lab.rpc.beaconUrl
+        ? "Execution block 来自 RPC；Beacon head/finality 来自可选 Beacon API，Engine API 仍不对浏览器开放。"
+        : "只连接了 Execution RPC；proposer、validator 与 Engine API 内部动作无法被直接观察。",
+      experiment?.receipt ? "receipt、block 和可用的 debug trace 来自当前 Execution RPC。" : "正在等待真实 receipt。",
+      experiment?.finalizedAt ? "safe/finalized tag 已覆盖目标区块。" : "正在等待 safe/finalized，或当前 RPC 不支持这些 block tags。",
+    ];
+    return {
+      label: event ? "实时实测" : "等待观察",
+      tone: event ? "observed" : "partial",
+      note: notes[stage],
+    };
+  }
   return {
     label: "教学示意",
     tone: "illustrative",
@@ -1187,6 +1381,11 @@ function transformationModel(tx) {
   const priorityFee = txField(tx, "maxPriorityFeePerGas", "未记录");
   const blockHash = tx.record?.blockHash || "uiTx.record 未保存 blockHash";
   const slot = tx.record?.includedSlot || builderEventDetail(tx, /head|proposed/i);
+  const txpoolWasCaptured = ["pending", "queued"].includes(pool[2]);
+  const isTxpoolObservation = activeKey === "live" || (activeKey === "experiment" && !txpoolWasCaptured);
+  const infraSnapshot = activeKey === "experiment" ? infraLab.snapshot() : null;
+  const executionOnlyExperiment = activeKey === "experiment" && /^anvil\//i.test(infraSnapshot?.rpc.clientVersion || "");
+  const builtBlockKind = executionOnlyExperiment ? "ExecutionBlock" : "ExecutionPayload";
 
   const models = [
     {
@@ -1382,7 +1581,7 @@ function transformationModel(tx) {
         {
           title: "执行入池规则",
           detail: "检查 chainId、nonce、余额、intrinsic gas、fee cap 与节点策略。",
-          result: activeKey === "live" ? "入池返回未捕获；该交易后来被有效区块执行" : "accepted by local admission",
+          result: isTxpoolObservation ? "入池返回未捕获或接口不可用；继续观察 txHash / receipt" : "accepted by local admission",
         },
         {
           title: "归类 txpool",
@@ -1396,8 +1595,8 @@ function transformationModel(tx) {
         },
       ],
       output: {
-        kind: activeKey === "live" ? "TxpoolObservation" : "TxpoolEntry",
-        title: activeKey === "live" ? "采集器读到的 txpool 时点快照" : "本地节点对交易的排队结果",
+        kind: isTxpoolObservation ? "TxpoolObservation" : "TxpoolEntry",
+        title: isTxpoolObservation ? "观察 RPC 返回的 txpool 时点快照" : "本地节点对交易的排队结果",
         rows: [
           ["node", pool[0] || "unknown"],
           ["observed at", pool[1] || "unknown"],
@@ -1405,38 +1604,48 @@ function transformationModel(tx) {
           ["nonce", pool[3] || nonce],
           ["detail", pool[4] || "未记录"],
         ],
-        note: activeKey === "live" ? "Live 的采样发生在入块后，因此 not present 不代表它从未 pending。" : "这是教学场景中的节点 txpool 快照。",
+        note: activeKey === "live"
+          ? "Live 的采样发生在入块后，因此 not present 不代表它从未 pending。"
+          : activeKey === "experiment"
+            ? "这是当前观察 RPC 的能力与时点结果；wallet 的广播 RPC 可能是另一台节点。"
+            : "这是教学场景中的节点 txpool 快照。",
       },
-      explanation: activeKey === "live"
-        ? "节点正常情况下会把通过 admission 的交易变成 TxpoolEntry；但这份 Live 在交易入块后才采样，因此实际留下的是一条 post-inclusion TxpoolObservation。"
+      explanation: isTxpoolObservation
+        ? "节点正常情况下会把通过 admission 的交易变成 TxpoolEntry；但当前只得到接口能力或采样时点结果，因此诚实显示为 TxpoolObservation。"
         : "节点把不可信的 raw bytes 逐项验证，只有通过本地 admission 规则后，才会把它变成可排队和传播的 TxpoolEntry。",
     },
     {
       input: {
-        kind: "BuildContext",
-        title: "Proposer 本 slot 的构建上下文",
+        kind: executionOnlyExperiment ? "AutoMineContext" : "BuildContext",
+        title: executionOnlyExperiment ? "Anvil 自动出块上下文" : "Proposer 本 slot 的构建上下文",
         rows: [
           ["current head", builderEventDetail(tx, /forkchoice|head/i)],
           ["candidate tx", tx.txHash],
           ["txpool status", pool[2] || "unknown"],
           ["slot / duty", slot],
         ],
-        note: "Proposer 只能从自己能看到的交易与当前 head 出发构建区块。",
+        note: executionOnlyExperiment
+          ? "Anvil 在收到交易后由本地执行节点自动产块，没有独立 CL 或 validator duty。"
+          : "Proposer 只能从自己能看到的交易与当前 head 出发构建区块。",
       },
       operations: [
         {
           title: "获得 proposer duty",
-          detail: "Beacon state 为当前 slot 选定 proposer。",
-          result: `proposer = ${tx.record?.proposerIndex ?? "Live 未抓取"}`,
+          detail: executionOnlyExperiment ? "Execution-only Anvil 不运行 Beacon proposer 选择。" : "Beacon state 为当前 slot 选定 proposer。",
+          result: executionOnlyExperiment ? "not present in Anvil" : `proposer = ${tx.record?.proposerIndex ?? "Live 未抓取"}`,
         },
         {
           title: "CL 通知 fork choice",
-          detail: "Consensus Client 调用 engine_forkchoiceUpdated，并附带 payload attributes。",
-          result: builderEventDetail(tx, /forkchoice|head/i),
+          detail: executionOnlyExperiment
+            ? "没有 Consensus Client；Anvil 自己维护本地 head。"
+            : "Consensus Client 调用 engine_forkchoiceUpdated，并附带 payload attributes。",
+          result: executionOnlyExperiment ? "no Engine API boundary" : builderEventDetail(tx, /forkchoice|head/i),
         },
         {
           title: "EL 选择并排序交易",
-          detail: "从本地 txpool 选择有效且可执行的交易，遵守 nonce 与 block gas limit。",
+          detail: executionOnlyExperiment
+            ? "Anvil 接收有效交易后按 automine 规则直接构建下一个 execution block。"
+            : "从本地 txpool 选择有效且可执行的交易，遵守 nonce 与 block gas limit。",
           result: `include tx ${tx.txHash}`,
         },
         {
@@ -1446,13 +1655,15 @@ function transformationModel(tx) {
         },
         {
           title: "取回 payload 并签块",
-          detail: "CL 调用 engine_getPayload；Validator Client 签署 Beacon Block。",
-          result: builderEventDetail(tx, /getPayload|proposed/i),
+          detail: executionOnlyExperiment
+            ? "Anvil 提交本地 execution block；没有 Beacon Block 或 validator BLS 签名。"
+            : "CL 调用 engine_getPayload；Validator Client 签署 Beacon Block。",
+          result: executionOnlyExperiment ? `execution block ${receiptBlock}` : builderEventDetail(tx, /getPayload|proposed/i),
         },
       ],
       output: {
-        kind: "ExecutionPayload",
-        title: "嵌入 Beacon Block 的执行区块",
+        kind: builtBlockKind,
+        title: executionOnlyExperiment ? "Anvil 生成的本地执行区块" : "嵌入 Beacon Block 的执行区块",
         rows: [
           ["slot", slot],
           ["blockNumber", receiptBlock],
@@ -1460,21 +1671,27 @@ function transformationModel(tx) {
           ["tx[transactionIndex]", `${tx.record?.transactionIndex ?? rowValue(tx.receipt, "transactionIndex")} → ${tx.txHash}`],
           ["proposerIndex", tx.record?.proposerIndex ?? "Live 未抓取"],
         ],
-        note: "这一步的输出不再是单笔交易，而是包含多笔交易及执行承诺的区块 payload。",
+        note: executionOnlyExperiment
+          ? "这是 execution block，不带 Beacon consensus envelope；不能用它学习 validator attestation。"
+          : "这一步的输出不再是单笔交易，而是包含多笔交易及执行承诺的区块 payload。",
       },
-      explanation: "EL 把 TxpoolEntry 与当前链头组合、排序并预执行，CL/Validator 再把所得 ExecutionPayload 封装并签成可广播区块。",
+      explanation: executionOnlyExperiment
+        ? "Anvil 把有效交易直接执行并写入本地 ExecutionBlock；完整 PoS 网络在这里还会多出 CL 的 Engine API 协调和 Validator Client 签署 Beacon Block。"
+        : "EL 把 TxpoolEntry 与当前链头组合、排序并预执行，CL/Validator 再把所得 ExecutionPayload 封装并签成可广播区块。",
     },
     {
       input: {
-        kind: "ExecutionPayload",
-        title: "其他节点收到的 proposed block",
+        kind: builtBlockKind,
+        title: executionOnlyExperiment ? "Anvil 本地执行区块" : "其他节点收到的 proposed block",
         rows: [
           ["blockNumber", receiptBlock],
           ["blockHash", blockHash],
           ["transactionIndex", tx.record?.transactionIndex ?? rowValue(tx.receipt, "transactionIndex")],
           ["transaction", tx.txHash],
         ],
-        note: "其他节点不能直接相信 proposer 给出的执行结果。",
+        note: executionOnlyExperiment
+          ? "Anvil 单节点模式没有第二台 Execution Client 进行独立重放；这里展示本地执行结果。"
+          : "其他节点不能直接相信 proposer 给出的执行结果。",
       },
       operations: [
         {
@@ -1513,15 +1730,17 @@ function transformationModel(tx) {
     },
     {
       input: {
-        kind: "ValidatedBlock",
-        title: "执行层已判定有效的区块",
+        kind: executionOnlyExperiment ? "ExecutionOnlyBlock" : "ValidatedBlock",
+        title: executionOnlyExperiment ? "Anvil 已写入的 execution block" : "执行层已判定有效的区块",
         rows: [
           ["blockNumber", receiptBlock],
           ["transaction status", receiptStatus],
           ["txHash", tx.txHash],
-          ["attestations", "等待 validators 对 head/source/target 投票"],
+          ["attestations", executionOnlyExperiment ? "not present in Anvil" : "等待 validators 对 head/source/target 投票"],
         ],
-        note: "交易已有 receipt，但所在区块仍可能处于 latest，尚未 finalized。",
+        note: executionOnlyExperiment
+          ? "交易已有 receipt，但没有 Beacon consensus，因此不存在 Ethereum PoS 的 attestation/finality 过程。"
+          : "交易已有 receipt，但所在区块仍可能处于 latest，尚未 finalized。",
       },
       operations: [
         {
@@ -1531,18 +1750,18 @@ function transformationModel(tx) {
         },
         {
           title: "Validators 发 attestation",
-          detail: "委员会对看到的 head 及 checkpoint 投票。",
-          result: "attestation weight accumulates",
+          detail: executionOnlyExperiment ? "Anvil 没有 validator committee。" : "委员会对看到的 head 及 checkpoint 投票。",
+          result: executionOnlyExperiment ? "not available: execution-only" : "attestation weight accumulates",
         },
         {
           title: "Fork choice 更新 safe",
-          detail: "足够共识权重降低短期 reorg 风险。",
-          result: rowValue(tx.finality, "safe", rowValue(tx.finality, "justified")),
+          detail: executionOnlyExperiment ? "没有 CL fork choice 或 safe head。" : "足够共识权重降低短期 reorg 风险。",
+          result: executionOnlyExperiment ? "not available: connect a PoS Beacon API" : rowValue(tx.finality, "safe", rowValue(tx.finality, "justified")),
         },
         {
           title: "Checkpoint finalized",
-          detail: "达到 supermajority link 后，区块及其中交易获得最终性。",
-          result: rowValue(tx.finality, "finalized"),
+          detail: executionOnlyExperiment ? "Anvil 没有 checkpoint finality。" : "达到 supermajority link 后，区块及其中交易获得最终性。",
+          result: executionOnlyExperiment ? "not available: execution-only" : rowValue(tx.finality, "finalized"),
         },
         {
           title: "提交 canonical state",
@@ -1551,15 +1770,19 @@ function transformationModel(tx) {
         },
       ],
       output: {
-        kind: "CanonicalState",
-        title: "链上状态与交易确认级别",
+        kind: executionOnlyExperiment ? "LocalExecutionState" : "CanonicalState",
+        title: executionOnlyExperiment ? "Anvil 本地状态（无 PoS finality）" : "链上状态与交易确认级别",
         rows: [
           ...(tx.diffs || []).map(([name, , after]) => [name, after]),
           ...(tx.finality || []).map(([name, time]) => [`confirmation.${name}`, time]),
         ],
-        note: "最终输出不是一个新 tx，而是被共识认可的区块位置和由交易造成的新状态。",
+        note: executionOnlyExperiment
+          ? "这是本地执行状态，不代表经过 validators 共识；连接 geth+lighthouse 与 Beacon API 后才能观察完整 PoS 路径。"
+          : "最终输出不是一个新 tx，而是被共识认可的区块位置和由交易造成的新状态。",
       },
-      explanation: "执行有效只是第一层；attestations 与 checkpoint 共识继续提高确认级别，最终把区块内状态变化固定到 canonical chain。",
+      explanation: executionOnlyExperiment
+        ? "Anvil 只完成交易执行和本地状态提交；完整 blockchain infra 还需要 Consensus Client、Validator Client、attestations 与 finality。"
+        : "执行有效只是第一层；attestations 与 checkpoint 共识继续提高确认级别，最终把区块内状态变化固定到 canonical chain。",
     },
   ];
 
@@ -1944,7 +2167,7 @@ function renderJourneyFocus(tx) {
             <p class="eyebrow">input → transform → output</p>
             <h2>${esc(scenario.label)} · ${esc(item.label)}</h2>
           </div>
-          <span class="compact-pill">${esc(activeKey === "live" ? "Live record" : "Snapshot")}</span>
+          <span class="compact-pill">${esc(activeKey === "live" ? "Live record" : activeKey === "experiment" ? "Real-time experiment" : "Snapshot")}</span>
         </div>
         ${renderTransformationBoard(model)}
       </section>
@@ -1984,19 +2207,196 @@ function renderJourneyFooter() {
   `;
 }
 
+function shortAddress(value) {
+  if (!value) return "未连接";
+  return `${value.slice(0, 8)}…${value.slice(-6)}`;
+}
+
+function renderInfraTrigger() {
+  const lab = infraLab.snapshot();
+  const rpcReady = lab.rpc.status === "connected";
+  const walletReady = lab.wallet.status === "connected";
+  const label = rpcReady
+    ? `${lab.rpc.chainName}${walletReady ? ` · ${shortAddress(lab.wallet.account)}` : " · 钱包未连"}`
+    : "连接 RPC / 钱包";
+  const tone = rpcReady && walletReady ? "ready" : rpcReady ? "partial" : "idle";
+  return `
+    <button class="infra-trigger ${tone}" data-infra-action="toggle" aria-expanded="${lab.open}">
+      <span class="infra-dot"></span>
+      <span>
+        <strong>基础设施实验</strong>
+        <small>${esc(label)}</small>
+      </span>
+    </button>
+  `;
+}
+
+function renderInfraEvents(experiment) {
+  if (!experiment?.events?.length) {
+    return `<p class="infra-empty">发送测试交易后，这里会逐条显示 Web、钱包、RPC、txpool、receipt 与 finality 观察。</p>`;
+  }
+  return `
+    <ol class="infra-events">
+      ${experiment.events
+        .map(
+          (event) => `
+            <li>
+              <span>${esc(event.at)}</span>
+              <div>
+                <strong>Step ${event.stage + 1} · ${esc(event.action)}</strong>
+                <code>${esc(event.result)}</code>
+              </div>
+            </li>
+          `,
+        )
+        .join("")}
+    </ol>
+  `;
+}
+
+function renderInfraDrawer() {
+  const lab = infraLab.snapshot();
+  if (!lab.open) return "";
+  const rpcReady = lab.rpc.status === "connected";
+  const walletReady = lab.wallet.status === "connected";
+  const chainMatch = rpcReady && walletReady && lab.rpc.chainId === lab.wallet.chainId;
+  const canSend = chainMatch && !lab.busy;
+  const walletStatus = walletReady
+    ? `${shortAddress(lab.wallet.account)} · chain ${lab.wallet.chainId}`
+    : lab.wallet.status === "unavailable"
+      ? "未检测到 EIP-1193 钱包"
+      : "等待用户授权";
+  return `
+    <div class="infra-backdrop" data-infra-action="close"></div>
+    <aside class="infra-drawer" aria-label="基础设施连接与交易实验">
+      <header class="infra-drawer-head">
+        <div>
+          <p class="eyebrow">infrastructure lab</p>
+          <h2>连接真实 RPC 与钱包</h2>
+          <p>钱包负责账户授权与签名；Execution RPC 负责节点读写与观察；Beacon API 负责可选的共识上下文。</p>
+        </div>
+        <button class="drawer-close" data-infra-action="close" aria-label="关闭">×</button>
+      </header>
+
+      <div class="infra-drawer-body">
+        <section class="infra-boundary-map">
+          <div><span>1</span><strong>Browser Wallet</strong><small>账户 + 用户确认 + 签名</small></div>
+          <b>→</b>
+          <div><span>2</span><strong>Execution RPC</strong><small>tx / txpool / receipt / block</small></div>
+          <b>→</b>
+          <div><span>3</span><strong>Beacon API</strong><small>head / slot / finality（可选）</small></div>
+        </section>
+
+        ${lab.error ? `<div class="infra-message error">${esc(lab.error)}</div>` : ""}
+        ${lab.notice ? `<div class="infra-message success">${esc(lab.notice)}</div>` : ""}
+
+        <section class="infra-card">
+          <div class="infra-card-head">
+            <div><span>01</span><h3>Execution RPC</h3></div>
+            <em class="status-${esc(lab.rpc.status)}">${esc(lab.rpc.status)}</em>
+          </div>
+          <p>请求从你运行浏览器的电脑发出。Remote 模式下，127.0.0.1 指你自己的电脑；请先把远程 RPC 端口转发到本机。URL 只保存在当前页面内存中。</p>
+          <p>例如：远程 8545 → 本机 18545，则这里和钱包都填写 http://127.0.0.1:18545。仅转发页面的 8088 端口不会转发 RPC。HTTPS 页面连接 HTTP RPC 时还需检查浏览器的混合内容与本地网络权限提示。</p>
+          <div class="infra-presets">
+            <button type="button" data-infra-preset="anvil">Local Anvil</button>
+            <button type="button" data-infra-preset="pos">Local PoS</button>
+            <span>远程测试网请粘贴自己的 RPC URL</span>
+          </div>
+          <label>
+            <span>Execution RPC URL</span>
+            <input id="infra-rpc-url" type="url" value="${esc(lab.rpc.url)}" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>
+            <span>Beacon API URL（可选）</span>
+            <input id="infra-beacon-url" type="url" value="${esc(lab.rpc.beaconUrl)}" placeholder="http://127.0.0.1:5052" autocomplete="off" spellcheck="false" />
+          </label>
+          <button class="infra-primary" type="button" data-infra-action="connect-rpc" ${lab.busy ? "disabled" : ""}>
+            ${lab.busy === "rpc" ? "连接中…" : rpcReady ? "重新检测 RPC" : "连接并检测 RPC"}
+          </button>
+          <dl class="infra-status-grid">
+            <div><dt>Network</dt><dd>${esc(rpcReady ? lab.rpc.chainName : "-")}</dd></div>
+            <div><dt>chainId</dt><dd>${esc(lab.rpc.chainId || "-")}</dd></div>
+            <div><dt>Block</dt><dd>${esc(lab.rpc.blockNumber ? `${lab.rpc.blockNumber} / ${hexToDecimal(lab.rpc.blockNumber)}` : "-")}</dd></div>
+            <div><dt>Client</dt><dd>${esc(lab.rpc.clientVersion || "-")}</dd></div>
+            <div><dt>Beacon</dt><dd>${esc(lab.rpc.beaconStatus)}</dd></div>
+            <div><dt>Finalized epoch</dt><dd>${esc(lab.rpc.finalizedEpoch || "-")}</dd></div>
+          </dl>
+        </section>
+
+        <section class="infra-card">
+          <div class="infra-card-head">
+            <div><span>02</span><h3>Browser Wallet</h3></div>
+            <em class="status-${esc(lab.wallet.status)}">${esc(lab.wallet.status)}</em>
+          </div>
+          <p>通过 EIP-1193 请求账户和交易确认。本页面不会接收、读取或保存私钥。</p>
+          <div class="wallet-summary">
+            <strong>${esc(walletStatus)}</strong>
+            ${rpcReady && walletReady ? `<small class="${chainMatch ? "match" : "mismatch"}">${chainMatch ? "✓ 钱包与观察 RPC 在同一 chainId" : "⚠ chainId 不一致，禁止发送"}</small>` : ""}
+          </div>
+          <div class="infra-actions">
+            <button class="infra-primary" type="button" data-infra-action="connect-wallet" ${lab.busy ? "disabled" : ""}>
+              ${lab.busy === "wallet" ? "等待钱包…" : walletReady ? "重新请求账户" : "连接浏览器钱包"}
+            </button>
+            ${rpcReady && walletReady && !chainMatch ? `<button type="button" data-infra-action="switch-wallet">切换钱包到 RPC 网络</button>` : ""}
+          </div>
+        </section>
+
+        <section class="infra-card experiment-card">
+          <div class="infra-card-head">
+            <div><span>03</span><h3>发送测试交易</h3></div>
+            <em>${esc(lab.experiment?.status || "idle")}</em>
+          </div>
+          <p>支持本机、局域网或私有网络上的 Anvil（31337）/开发网（20230618），以及 Sepolia、Hoodi。钱包确认后，页面通过选定 RPC 观察 txpool、receipt、block 与 finality。</p>
+          <label>
+            <span>To</span>
+            <input id="infra-tx-to" value="${esc(lab.experiment?.to || "0x000000000000000000000000000000000000b0b0")}" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="infra-field-row">
+            <label>
+              <span>Value (ETH)</span>
+              <input id="infra-tx-value" inputmode="decimal" value="0.001" />
+            </label>
+            <label>
+              <span>Calldata</span>
+              <input id="infra-tx-data" value="0x" autocomplete="off" spellcheck="false" />
+            </label>
+          </div>
+          <button class="infra-primary send" type="button" data-infra-action="send" ${canSend ? "" : "disabled"}>
+            ${lab.busy === "transaction" ? "等待钱包确认…" : "构造交易并请求钱包发送"}
+          </button>
+          <div class="infra-safety-note">
+            <strong>观察边界</strong>
+            <p>钱包 Provider 负责真实广播；本页选择的 RPC 是独立观察者。只有 chainId 一致，不代表两者是同一台节点。Execution RPC 也看不到内部 Engine API 或 validator 签名。</p>
+          </div>
+          ${renderInfraEvents(lab.experiment)}
+        </section>
+      </div>
+    </aside>
+  `;
+}
+
 function renderWalkthrough() {
   const tx = TXS[activeKey];
   const def = typeDef();
   const scenario = scenarioMeta(tx);
-  const sourceLabel = activeKey === "live" ? "Live · 历史实测" : "Snapshot · 教学示意";
+  const sourceLabel = activeKey === "live"
+    ? "Live · 历史实测"
+    : activeKey === "experiment"
+      ? "Experiment · 实时观察"
+      : "Snapshot · 教学示意";
   app.innerHTML = `
     <header class="topbar">
       <div>
         <strong>Tx Flight Recorder</strong>
         <span>从 Web 发起到上链确认</span>
       </div>
-      <div class="mode-pill">Step ${stage + 1}/${FLOW_STEPS.length} · Type ${esc(activeType)} ${esc(def.name)}</div>
+      <div class="topbar-actions">
+        <div class="mode-pill">Step ${stage + 1}/${FLOW_STEPS.length} · Type ${esc(activeType)} ${esc(def.name)}</div>
+        ${renderInfraTrigger()}
+      </div>
     </header>
+
+    ${renderInfraDrawer()}
 
     <main class="walkthrough-main">
       <section class="walkthrough-intro">
@@ -2103,6 +2503,47 @@ function bindJourneyEvents() {
       stage = Math.max(0, Math.min(FLOW_STEPS.length - 1, stage + delta));
       stopJourneyTimer();
       renderWalkthrough();
+    });
+  });
+
+  document.querySelectorAll("[data-infra-preset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const rpcInput = document.querySelector("#infra-rpc-url");
+      const beaconInput = document.querySelector("#infra-beacon-url");
+      if (!rpcInput || !beaconInput) return;
+      if (button.dataset.infraPreset === "anvil") {
+        rpcInput.value = "http://127.0.0.1:8545";
+        beaconInput.value = "";
+      } else {
+        rpcInput.value = "http://127.0.0.1:8545";
+        beaconInput.value = "http://127.0.0.1:5052";
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-infra-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.infraAction;
+      if (action === "toggle") {
+        infraLab.setOpen(!infraLab.snapshot().open);
+      } else if (action === "close") {
+        infraLab.setOpen(false);
+      } else if (action === "connect-rpc") {
+        infraLab.connectRpc({
+          rpcUrl: document.querySelector("#infra-rpc-url")?.value || "",
+          beaconUrl: document.querySelector("#infra-beacon-url")?.value || "",
+        });
+      } else if (action === "connect-wallet") {
+        infraLab.connectWallet();
+      } else if (action === "switch-wallet") {
+        infraLab.switchWalletToRpc();
+      } else if (action === "send") {
+        infraLab.sendExperiment({
+          to: document.querySelector("#infra-tx-to")?.value || "",
+          valueEth: document.querySelector("#infra-tx-value")?.value || "",
+          data: document.querySelector("#infra-tx-data")?.value || "",
+        });
+      }
     });
   });
 }

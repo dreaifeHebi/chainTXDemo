@@ -180,9 +180,143 @@ VALUE_WEI=1000000000000000 \
 node scripts/run-live-transfer.mjs
 ```
 
+## Interactive browser infrastructure lab
+
+The upper-right `Infrastructure Lab` connects three boundaries independently:
+
+- an Execution JSON-RPC endpoint for chain metadata, transaction observation,
+  txpool (when exposed), receipts, blocks, traces, and safe/finalized tags
+- an EIP-1193 browser wallet for account permission and user-approved signing
+- an optional Beacon API endpoint for head/slot/finality context
+
+The page never asks for or stores a private key. The wallet provider performs
+the real broadcast. The Execution RPC selected in the page is an independent
+observer; matching chain IDs do not prove that it is the same endpoint the
+wallet used to broadcast.
+
+For a local execution-only exercise:
+
+```bash
+./scripts/start-anvil-devnet.sh
+python3 -m http.server 8088 --bind 127.0.0.1
+```
+
+Configure a browser wallet with the dev-only network/account printed by Anvil:
+
+```text
+RPC URL:  http://127.0.0.1:8545
+chain ID: 31337
+currency: ETH
+```
+
+The same development chain can be used through a LAN/private-network address
+or a forwarded loopback port. Sending is enabled for Anvil (chain ID 31337)
+and the demo PoS devnet (20230618) on loopback, RFC1918 IPv4, private mesh
+addresses (100.64.0.0/10), and IPv6 unique-local addresses. Sepolia and Hoodi
+are also supported. A loopback URL alone does not permit mainnet transactions.
+
+Never reuse Anvil's public development keys on a real network. In the page,
+open `Infrastructure Lab`, connect the RPC and wallet, confirm their chain IDs
+match, and send a small transfer. The interactive scenario records Web input,
+RPC preflight, wallet confirmation, tx hash, txpool capability, receipt, block,
+trace availability, state changes, and finality tags.
+
+For public testing, use your own HTTPS Sepolia RPC and test ETH. Sepolia is the
+default application testnet; Hoodi is intended for validator/staking and
+protocol-infrastructure testing. See the official
+[Ethereum networks guide](https://ethereum.org/developers/docs/networks/).
+
+Execution RPC alone cannot reveal internal Engine API calls, proposer signing,
+or validator attestations. Use the separated Kurtosis PoS devnet plus its
+Beacon API for consensus context. Engine API must remain an authenticated
+node-internal boundary, not a browser-facing endpoint.
+
+## Remote development and port forwarding
+
+The JavaScript RPC requests run on the machine hosting your browser, not on the
+remote machine serving these files. Forward both the page and execution RPC.
+For example, run this on your own computer (replace `user@remote-host`):
+
+```bash
+ssh -N -L 127.0.0.1:8088:127.0.0.1:8088 -L 127.0.0.1:18545:127.0.0.1:8545 user@remote-host
+```
+
+Open `http://127.0.0.1:8088`, set the page's RPC URL and the wallet's network RPC
+to `http://127.0.0.1:18545`, and use the chain ID actually returned by that RPC
+(`31337` for the default Anvil). VS Code Remote's Ports panel can provide the
+same two forwards; use its actual forwarded local addresses.
+
+Test the forwarded endpoint **on the browser computer**:
+
+```bash
+curl --max-time 5 -i -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+  http://127.0.0.1:18545
+curl --max-time 5 -i -X OPTIONS -H 'Origin: http://127.0.0.1:8088' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type' http://127.0.0.1:18545
+```
+
+The first response must be JSON-RPC, not a login page or HTML proxy error.
+For cross-origin browser requests, OPTIONS and POST must allow the page's
+origin and the preflight must allow POST and Content-Type. SSH port forwarding
+passes HTTP headers through; a reverse proxy may change them. A forwarded
+endpoint protected by a web login may work in a tab but fail in a wallet.
+
+`strict-origin-when-cross-origin` is a Referrer Policy, not itself a CORS error.
+Inspect the actual Console error and failed OPTIONS/POST response. Browser
+mixed-content or local-network permissions can also block a request even if
+curl succeeds. Prefer forwarding the page to local HTTP together with the RPC
+for this local exercise. Changing fetch to `no-cors` cannot make JSON-RPC
+responses readable.
+
+## Cloudflare Pages deployment
+
+Production domain: `https://chaintxdemo.dreaifehebi.com`.
+Pages project: `chaintxdemo`, production branch: `master`.
+
+```bash
+npm ci
+npm run check
+npm test
+npm run build
+```
+
+Only the six explicitly selected public assets are copied into `dist/`.
+Local `output/live-record.json`, recordings, devnet files, secrets, and scripts
+are excluded. A `404.html` prevents Pages from returning the app HTML for a
+missing local recording. The public site starts with the teaching examples;
+connect your RPC and wallet to start an interactive experiment.
+
+The GitHub Actions workflow checks and builds pull requests. On a push to
+`master` (or a manual run on `master`), it deploys the checked artifact with
+the locked Wrangler version, creates the Pages project if absent, and attaches
+the custom domain and CNAME. Existing DNS pointing elsewhere is never replaced.
+
+Configure these repository Actions secrets once:
+
+| Secret | Value |
+| --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account containing the Pages project |
+| `CLOUDFLARE_API_TOKEN` | Token with Account / Cloudflare Pages / Edit, plus Zone / Zone / Read and Zone / DNS / Edit scoped to `dreaifehebi.com` for domain setup |
+
+After adding secrets, use Actions → Check and deploy Cloudflare Pages → Run
+workflow. First-time DNS and certificate activation can take several minutes;
+the workflow reports the domain status. The Pages hostname is
+`https://chaintxdemo.pages.dev`.
+
+The deployed site serves the frontend, not an Anvil instance or an RPC relay.
+RPC calls still originate in your browser: use a reachable HTTPS testnet RPC,
+or grant the browser's local-network permission for your private devnet.
+Keep private IPs on direct connection in proxy extensions such as ZeroOmega.
+Hosting the page on Cloudflare does not bypass RPC CORS or browser network
+permissions. Wallet transactions require the wallet network to match the RPC.
+
 ## Current scope
 
-The static sample records remain available. The live path now covers a real
-local transfer plus RPC, txpool, receipt, debug trace, block, and optional
-beacon/finality context. Contract deployment/calls and Engine API snooper
-capture can reuse the same `uiTx` record shape next.
+The static sample records remain available. The file-backed live path covers a
+real local transfer plus RPC, txpool, receipt, debug trace, block, and optional
+beacon/finality context. The browser lab adds user-driven EIP-1193 transfers and
+real-time observation without persisting RPC credentials or wallet secrets.
+Contract deployment/calls and bounded Engine API capture can reuse the same
+`uiTx` record shape next.
